@@ -1,0 +1,27 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Секреты и данные проекта — НИКОГДА в репозиторий
+.env
+*.session
+*.session-journal
+*.db
+*.db-journal
+
+# Локальные артефакты
+logs/
+backups/
+last_report.txt
+found_export_*.csv
+qr_*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
