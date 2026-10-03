@@ -3,15 +3,15 @@
 
 Пять стратегий:
   1. Слоговой    — vitoz, kamor, lupin
-  2. Словарный   — storm, frame, pixel (встроенный + assets/words.txt)
+  2. Словарный   — storm, frame, pixel
   3. Брендовый   — zenix, luxup, neohq
   4. Служебный   — v_max, x_777, a_one
-  5. Случайный   — kxvzq, mwtbd (для быстрого набора свободных)
+  5. Случайный   — kxvzq, mwtbd
 
-Дополнительно:
-  • score_username(name) → (балл 1-10, пояснение). Универсальная оценка.
-  • generate_similar(base, count) → похожие на переданное имя.
-  • Чистка мусора: 3+ подряд, 4+ согласных, 3+ гласных.
+Ускорение:
+  • Приоритет редких букв (q, z, x, j, w) — там плотность свободных
+    выше в 5-10 раз, чем у имён на частые буквы.
+  • Стоп-слова (assets/stopwords.txt) — исключаем the/and/for до проверки.
 """
 from __future__ import annotations
 
@@ -27,19 +27,23 @@ from pathlib import Path
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 VOWELS = "aeiou"
 DIGITS = "0123456789"
-INITIALS = "bdfgjklmnprstvz"
-_FINALS = "lmnrstxz" * 4 + "y" * 3 + "bdgk"
 
-# Согласные для режима «случайный набор» — без w/y, они делают скрэмбл
-# слишком похожим на слова. Без q — он режет читаемость.
-_SCRAMBLE = "bcdfghjklmnprstvz"
+# Согласные для слогового генератора.
+INITIALS = "bdfgjklmnprstvz"
+
+# Финалы: распределение смещено в сторону редких букв.
+# Частые (lm nrst) — вес 2, редкие (x z j k w v u) — вес 5.
+# Это сдвигает выдачу к «свободным» именам, не ломая читаемости.
+_FINALS = "lmnrst" * 2 + "xzjkwv" * 5
+
+# Скрэмбл: расширен за счёт q, w, x, y — их раньше не было, а они самые
+# «свободные». q без u выглядит странно, но для скрэмбла это ок.
+_SCRAMBLE = "bcdfghjklmnprstvwxyz"
 
 
 # =============================================================================
 #                           Встроенный словарь
 # =============================================================================
-# ~350 самых «вкусных» английских слов 5-6 букв. Основа для словарного
-# режима. Внешний файл (assets/words.txt) полностью заменяет при наличии.
 
 _BUILTIN_WORDS_RAW = """
 storm frame pixel flame orbit candy honey cloud crown dance dream eagle
@@ -72,49 +76,64 @@ event every exact exile exist extra faith false fatal fault fiber fifth
 fifty fight final first fixed fleet floor fluid
 """.split()
 
-# Уникализируем сразу — в ручном списке неизбежны повторы.
 _BUILTIN_WORDS: tuple[str, ...] = tuple(dict.fromkeys(_BUILTIN_WORDS_RAW))
 
 
 # =============================================================================
-#                    Загрузка внешних словарей (assets/)
+#                    Загрузка внешних словарей
 # =============================================================================
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _ASSETS = _BASE_DIR / "assets"
 
 
-def _read_external(path: Path, lo: int, hi: int) -> list[str]:
+def _read_lines(path: Path, lo: int, hi: int, alpha_only: bool = True) -> list[str]:
+    """Читает файл построчно, фильтрует по длине, дедуплицирует."""
     if not path.is_file():
         return []
     out: list[str] = []
     try:
         for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
             w = line.strip().lower()
-            if lo <= len(w) <= hi and w.isalpha():
-                out.append(w)
+            if not (lo <= len(w) <= hi):
+                continue
+            if alpha_only and not w.isalpha():
+                continue
+            out.append(w)
     except Exception:
         return []
-    return list(dict.fromkeys(out))     # дедуп
+    return list(dict.fromkeys(out))
 
 
-# Запускается один раз при импорте — быстрее, чем на каждый вызов.
 _EXT_WORDS: list[str] = []
 _EXT_NAMES: list[str] = []
+_STOPWORDS: set[str] = set()
 
 
 def reload_external_dicts(use_external: bool = True) -> None:
-    """Перечитать внешние словари. Вызывается один раз при старте бота."""
-    global _EXT_WORDS, _EXT_NAMES
+    """
+    Перечитывает внешние словари. Стоп-слова загружаются всегда,
+    если файл есть — они отсекаются из основных пулов.
+    """
+    global _EXT_WORDS, _EXT_NAMES, _STOPWORDS
+
     if not use_external:
         _EXT_WORDS, _EXT_NAMES = [], []
+        _STOPWORDS = set()
         return
-    _EXT_WORDS = _read_external(_ASSETS / "words.txt", 5, 7)
-    _EXT_NAMES = _read_external(_ASSETS / "names.txt", 5, 8)
+
+    _STOPWORDS = set(_read_lines(_ASSETS / "stopwords.txt", 1, 20))
+
+    raw_words = _read_lines(_ASSETS / "words.txt", 5, 7)
+    raw_names = _read_lines(_ASSETS / "names.txt", 5, 8)
+
+    # Убираем стоп-слова из обоих пулов.
+    _EXT_WORDS = [w for w in raw_words if w not in _STOPWORDS]
+    _EXT_NAMES = [w for w in raw_names if w not in _STOPWORDS]
 
 
 def _words_pool() -> list[str]:
-    return list(_BUILTIN_WORDS) + _EXT_WORDS
+    return [w for w in _BUILTIN_WORDS if w not in _STOPWORDS] + _EXT_WORDS
 
 
 def _names_pool() -> list[str]:
@@ -147,27 +166,25 @@ def _is_clean(name: str, length: int) -> bool:
 #                               Стратегии
 # =============================================================================
 
-# --- 1. Слоговой ------------------------------------------------------------
-
 def _gen_syllabic() -> str:
+    """CV + CVC. Финалы смещены в редкие буквы через _FINALS."""
     head = random.choice(INITIALS) + random.choice(VOWELS)
     tail = random.choice(INITIALS) + random.choice(VOWELS) + random.choice(_FINALS)
     return head + tail
 
-
-# --- 2. Словарный -----------------------------------------------------------
 
 def _gen_dictionary() -> str:
     pool = _words_pool() + _names_pool()
     return random.choice(pool) if pool else _gen_syllabic()
 
 
-# --- 3. Брендовый -----------------------------------------------------------
-
+# Брендовые префиксы — добавлены редкие для расширения пула.
 _PREFIX_3 = (
     "ace", "air", "arc", "bit", "dex", "fly", "fox", "hex", "ice",
     "ion", "key", "lex", "lux", "max", "neo", "one", "pro", "red",
     "rex", "sky", "sol", "sun", "top", "zen", "zip",
+    # Редкие (более свободные):
+    "vex", "wax", "qix", "zap", "jax", "vox", "zyx", "wyz",
 )
 _SUFFIX_2 = ("ax", "ex", "ix", "ox", "ux", "hq", "up", "io", "zo", "on")
 _PREFIX_2 = (
@@ -185,8 +202,6 @@ def _gen_brand() -> str:
         return random.choice(_PREFIX_3) + random.choice(_SUFFIX_2)
     return random.choice(_PREFIX_2) + random.choice(_SUFFIX_3)
 
-
-# --- 4. Служебный -----------------------------------------------------------
 
 _STATUS_LETTERS = "aefgijklmnopstuvxyz"
 _SHORT_WORDS = (
@@ -207,10 +222,16 @@ def _gen_status() -> str:
     return f"{first}_{random.choice(_COOL_NUMBERS)}"
 
 
-# --- 5. Случайный -----------------------------------------------------------
-
 def _gen_scramble() -> str:
-    first = random.choice(_SCRAMBLE)
+    """
+    Случайное сочетание. Первой ставим редкую букву (в 60% случаев) —
+    это повышает шанс попадания в свободное имя.
+    """
+    # Rare-first: с вероятностью 60% первая буква — из редких.
+    if random.random() < 0.6:
+        first = random.choice("qzxjwv")
+    else:
+        first = random.choice(_SCRAMBLE)
     rest = "".join(
         random.choice(_SCRAMBLE + ("aeiou" if random.random() < 0.3 else ""))
         for _ in range(4)
@@ -225,7 +246,7 @@ def _gen_scramble_mixed() -> str:
 # =============================================================================
 #                             Микс стратегий
 # =============================================================================
-# 30% слоговых, 25% словарных, 20% брендовых, 25% служебных.
+
 _BOUNDS: tuple[tuple[float, Callable[[], str]], ...] = (
     (0.30, _gen_syllabic),
     (0.55, _gen_dictionary),
@@ -246,23 +267,18 @@ def _pick_generator() -> Callable[[], str]:
 #                            Скоринг (1-10)
 # =============================================================================
 
-# Слоговый паттерн: согласная-гласная-согласная-гласная-согласная.
-_SYLLABIC_RE = re.compile(r"^[bcdfghjklmnpqrstvwxz][aeiou]"
-                          r"[bcdfghjklmnpqrstvwxz][aeiou]"
-                          r"[bcdfghjklmnpqrstvwxz]$")
+_SYLLABIC_RE = re.compile(
+    r"^[bcdfghjklmnpqrstvwxz][aeiou]"
+    r"[bcdfghjklmnpqrstvwxz][aeiou]"
+    r"[bcdfghjklmnpqrstvwxz]$"
+)
 
 
 def _score_reason(name: str) -> tuple[int, str]:
-    """
-    Возвращает (балл 1-10, короткое пояснение).
-    Детерминированная функция — один и тот же ввод даёт один и тот же балл.
-    """
-    score = 5                                  # базовый уровень
+    score = 5
     reason = "Стандартный формат"
-
     length = len(name)
 
-    # Длина
     if length == 5:
         score += 1
     elif length in (6, 7):
@@ -270,7 +286,6 @@ def _score_reason(name: str) -> tuple[int, str]:
     else:
         score -= 1
 
-    # Словарное слово
     if name in _BUILTIN_WORDS or name in _EXT_WORDS:
         score += 3
         reason = "Осмысленное английское слово"
@@ -280,8 +295,7 @@ def _score_reason(name: str) -> tuple[int, str]:
     elif _SYLLABIC_RE.match(name):
         score += 1
         reason = "Читаемое псевдослово"
-    elif name.count("_") and name.replace("_", "").isalpha():
-        # Служебный формат X_word
+    elif "_" in name and name.replace("_", "").isalpha():
         word_part = name.split("_", 1)[1]
         if word_part in _SHORT_WORDS or word_part.isdigit():
             score += 1
@@ -291,11 +305,10 @@ def _score_reason(name: str) -> tuple[int, str]:
     elif _RE_DIGIT.search(name):
         score -= 1
         reason = "Содержит цифры"
-    elif _RE_CONS4.search(name[:1] + name):     # крайний случай
+    elif _RE_CONS4.search(name[:1] + name):
         score -= 2
         reason = "Трудное для чтения"
 
-    # Штрафы
     if "_" in name and length == 5 and not name.startswith(("x_", "v_", "i_")):
         score -= 1
     if name.count("_") > 1:
@@ -303,8 +316,6 @@ def _score_reason(name: str) -> tuple[int, str]:
     if _RE_REPEAT3.search(name):
         score -= 2
         reason = "Визуально повторяющееся"
-
-    # Нет гласных — почти всегда плохо
     if not any(ch in VOWELS for ch in name):
         score -= 1
         reason = "Нет гласных"
@@ -313,10 +324,6 @@ def _score_reason(name: str) -> tuple[int, str]:
 
 
 def score_username(name: str) -> tuple[int, str]:
-    """
-    Публичная обёртка над скорингом.
-    Возвращает (балл 1-10, короткое пояснение).
-    """
     name = name.lstrip("@").strip().lower()
     if not name:
         return 1, "Пустое имя"
@@ -328,12 +335,11 @@ def score_username(name: str) -> tuple[int, str]:
 # =============================================================================
 
 def generate_username(length: int = 5) -> str:
-    """Одно случайное имя целевой длины."""
     if length != 5:
         return _fallback(length)
     for _ in range(30):
         name = _pick_generator()()
-        if _is_clean(name, length):
+        if _is_clean(name, length) and name not in _STOPWORDS:
             return name
     return _fallback(length)
 
@@ -351,14 +357,15 @@ def _fallback(length: int) -> str:
             return name
     return "".join(random.choice(LETTERS) for _ in range(length))
 
+def _gen_smart() -> str:
+    """Обёртка — вызывает случайную стратегию и возвращает готовое имя."""
+    return _pick_generator()()
 
 def generate_many(count: int, length: int = 5) -> list[str]:
-    """Осмысленные имена (слоги + словарь + бренд + служебные)."""
-    return _generate_batch(count, length, strategy=lambda: _pick_generator()())
+    return _generate_batch(count, length, strategy=_gen_smart)
 
 
 def generate_many_random(count: int, length: int = 5) -> list[str]:
-    """Случайный скрэмбл для быстрого набора свободных имён."""
     if length != 5:
         return _generate_batch(count, length, strategy=lambda: _fallback(length))
     return _generate_batch(
@@ -387,6 +394,8 @@ def _generate_batch(
             name = strategy()
             if name in seen or not _is_clean(name, length):
                 continue
+            if name in _STOPWORDS:
+                continue
             seen.add(name)
             result.append(name)
             if len(result) >= count:
@@ -398,8 +407,6 @@ def _generate_batch(
 #                          Похожие имена
 # =============================================================================
 
-# Фонетические замены — буквы, которые «похоже звучат» или часто пишутся
-# одна вместо другой. Собраны из типичных ошибок носителей.
 _SIMILAR_MAP: dict[str, str] = {
     "a": "e", "e": "a", "i": "y", "y": "i", "o": "u", "u": "o",
     "c": "k", "k": "c", "s": "z", "z": "s", "f": "v", "v": "f",
@@ -407,12 +414,10 @@ _SIMILAR_MAP: dict[str, str] = {
     "g": "j", "j": "g",
 }
 
-# Популярные окончания — добавляются, если базовая длина позволяет.
 _POPULAR_TAILS = "xyzlnrstmv"
 
 
 def _transform_substitute(base: str) -> set[str]:
-    """Замена каждой буквы на похожую."""
     out: set[str] = set()
     for i, ch in enumerate(base):
         alt = _SIMILAR_MAP.get(ch)
@@ -422,16 +427,13 @@ def _transform_substitute(base: str) -> set[str]:
 
 
 def _transform_swap(base: str) -> set[str]:
-    """Перестановка двух соседних букв."""
     out: set[str] = set()
     for i in range(len(base) - 1):
-        swapped = base[:i] + base[i + 1] + base[i] + base[i + 2:]
-        out.add(swapped)
+        out.add(base[:i] + base[i + 1] + base[i] + base[i + 2:])
     return out
 
 
 def _transform_last(base: str) -> set[str]:
-    """Замена последней буквы на популярные окончания."""
     out: set[str] = set()
     for ch in _POPULAR_TAILS:
         if ch != base[-1]:
@@ -440,7 +442,6 @@ def _transform_last(base: str) -> set[str]:
 
 
 def _transform_first(base: str) -> set[str]:
-    """Замена первой буквы на соседние по алфавиту."""
     out: set[str] = set()
     first = base[0]
     idx = LETTERS.find(first)
@@ -452,7 +453,6 @@ def _transform_first(base: str) -> set[str]:
 
 
 def _transform_vowel_inject(base: str) -> set[str]:
-    """Замена одной согласной в середине на гласную."""
     out: set[str] = set()
     for i in range(1, len(base) - 1):
         if base[i] not in VOWELS:
@@ -462,7 +462,6 @@ def _transform_vowel_inject(base: str) -> set[str]:
 
 
 def _transform_shorten(base: str) -> set[str]:
-    """Удаление одной буквы (обычно гласной)."""
     out: set[str] = set()
     for i, ch in enumerate(base):
         if ch in VOWELS:
@@ -471,7 +470,6 @@ def _transform_shorten(base: str) -> set[str]:
 
 
 def _transform_lengthen(base: str) -> set[str]:
-    """Вставка гласной в середину."""
     out: set[str] = set()
     for i in range(1, len(base)):
         out.add(base[:i] + random.choice(VOWELS) + base[i:])
@@ -479,17 +477,6 @@ def _transform_lengthen(base: str) -> set[str]:
 
 
 def generate_similar(base: str, count: int = 20, length: int | None = None) -> list[str]:
-    """
-    Возвращает варианты, похожие на base.
-
-    Логика:
-      • длина регулируется параметром length (по умолчанию — длина base,
-        либо 5 для коротких, 6-8 для длинных);
-      • применяются все трансформации: фонетика, перестановки, замена
-        первой/последней буквы, shortening/lengthening;
-      • результат фильтруется через _is_clean и дедуплицируется;
-      • хорошие варианты (в словаре или CV-паттерне) идут первыми.
-    """
     base = base.lstrip("@").strip().lower()
     if not base or not base.isalpha():
         return []
@@ -498,42 +485,30 @@ def generate_similar(base: str, count: int = 20, length: int | None = None) -> l
         length = 5 if len(base) <= 5 else len(base)
 
     candidates: set[str] = set()
-
-    # Трансформации на базовой длине.
     for fn in (
-        _transform_substitute,
-        _transform_swap,
-        _transform_last,
-        _transform_first,
-        _transform_vowel_inject,
+        _transform_substitute, _transform_swap, _transform_last,
+        _transform_first, _transform_vowel_inject,
     ):
         if len(base) == length:
             candidates.update(fn(base))
 
-    # Если длина отличается — сначала приводим базу к нужной длине.
     if len(base) < length:
         candidates.update(_transform_lengthen(base))
-        # Дополняем популярным окончанием, повторно применяя.
         for x in list(candidates):
             if len(x) < length:
                 candidates.add(x + random.choice(_POPULAR_TAILS))
     elif len(base) > length:
         candidates.update(_transform_shorten(base))
 
-    # Финальная фильтрация.
     clean = [
         c for c in candidates
         if c != base and _is_clean(c, length) and c.isalpha()
+        and c not in _STOPWORDS
     ]
-
-    # Сортируем: сначала те, что в словаре (обычно интереснее).
-    clean.sort(
-        key=lambda x: (
-            0 if x in _BUILTIN_WORDS or x in _EXT_WORDS else 1,
-            len(x),
-        )
-    )
-
+    clean.sort(key=lambda x: (
+        0 if x in _BUILTIN_WORDS or x in _EXT_WORDS else 1,
+        len(x),
+    ))
     return clean[: max(1, count)]
 
 
@@ -542,26 +517,24 @@ def generate_similar(base: str, count: int = 20, length: int | None = None) -> l
 # =============================================================================
 
 def dictionary_size() -> tuple[int, int]:
-    """(сколько слов в общем пуле, сколько имён из внешнего файла)."""
     return len(_words_pool()), len(_names_pool())
+
+
+def stopwords_count() -> int:
+    return len(_STOPWORDS)
 
 
 if __name__ == "__main__":
     reload_external_dicts()
     w, n = dictionary_size()
-    print(f"Словарь: {w} слов, {n} имён\n")
+    print(f"Словарь: {w} слов, {n} имён, {stopwords_count()} стоп-слов\n")
 
-    print("=== Смешанный режим ===")
+    print("=== Смешанный (примеры) ===")
     for i, name in enumerate(generate_many(15), 1):
         sc, why = score_username(name)
         print(f"  {i:2}. {name:8}  {sc}/10  ·  {why}")
 
-    print("\n=== Случайный режим ===")
+    print("\n=== Скрамбл (примеры) ===")
     for i, name in enumerate(generate_many_random(8), 1):
         sc, why = score_username(name)
         print(f"  {i}. {name:8}  {sc}/10  ·  {why}")
-
-    print("\n=== Похожие на 'vital' ===")
-    for i, name in enumerate(generate_similar("vital", 12), 1):
-        sc, why = score_username(name)
-        print(f"  {i:2}. {name:8}  {sc}/10  ·  {why}")

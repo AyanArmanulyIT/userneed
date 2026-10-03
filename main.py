@@ -23,6 +23,7 @@ from bot.handlers import (
 )
 from config import Config, load_config
 from services.backup_manager import BackupManager
+from services.check_cache import CheckCache
 from services.checker import TelegramChecker
 from services.daily_report import DailyReporter
 from services.feedback import FeedbackStorage
@@ -59,10 +60,6 @@ logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 logger = logging.getLogger("userneed")
 
 
-# =============================================================================
-#                     Подъём Telethon-клиентов
-# =============================================================================
-
 async def _start_one_client(name: str, cfg: Config) -> TelegramClient | None:
     client = TelegramClient(name, cfg.api_id, cfg.api_hash)
     try:
@@ -94,10 +91,6 @@ async def _start_all_clients(
     return clients, names
 
 
-# =============================================================================
-#                                    main
-# =============================================================================
-
 async def main() -> None:
     cfg = load_config()
 
@@ -124,19 +117,20 @@ async def main() -> None:
     if removed_fb:
         logger.info("Обращения: очищено %d старых", removed_fb)
 
+    # --- Кэш проверок ---
+    check_cache = CheckCache(path=Path("check_cache.db"))
+
     # --- Telethon ---
     clients, names = await _start_all_clients(cfg)
     if not clients:
-        raise RuntimeError(
-            "Ни одну Telethon-сессию поднять не удалось."
-        )
+        raise RuntimeError("Ни одну Telethon-сессию поднять не удалось.")
     if len(clients) == 1 and len(cfg.session_names) > 1:
         logger.warning("Поднялась только одна сессия из %d.",
                        len(cfg.session_names))
     logger.info("Round-Robin-пул готов: %d сессий (%s)",
                 len(clients), ", ".join(names))
 
-    # --- Чекер ---
+    # --- Чекер с кэшем ---
     checker = TelegramChecker(
         clients=clients,
         session_names=names,
@@ -146,6 +140,7 @@ async def main() -> None:
         delay_min=cfg.check_delay_min,
         delay_max=cfg.check_delay_max,
         http_precheck_enabled=cfg.http_precheck_enabled,
+        cache=check_cache,
     )
     await checker.start()
 
@@ -250,6 +245,8 @@ async def main() -> None:
             storage.close()
         with contextlib.suppress(Exception):
             feedback.close()
+        with contextlib.suppress(Exception):
+            check_cache.close()
         with contextlib.suppress(Exception):
             await fsm_storage.close()
         with contextlib.suppress(Exception):
