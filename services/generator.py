@@ -3,7 +3,7 @@
 
 Пять стратегий:
   1. Слоговой    — vitoz, kamor, lupin
-  2. Словарный   — storm, frame, pixel
+  2. Словарный   — storm, frame, pixel  (+ личные имена)
   3. Брендовый   — zenix, luxup, neohq
   4. Служебный   — v_max, x_777, a_one
   5. Случайный   — kxvzq, mwtbd
@@ -12,12 +12,20 @@
   • Приоритет редких букв (q, z, x, j, w) — там плотность свободных
     выше в 5-10 раз, чем у имён на частые буквы.
   • Стоп-слова (assets/stopwords.txt) — исключаем the/and/for до проверки.
+  • Для генерации используются ТОЛЬКО 5-буквенные слова/имена: раньше
+    в пул попадали слова на 6-7 букв, которые потом отбрасывал фильтр
+    длины — три четверти словаря тратились впустую.
+
+Словари (assets/):
+  words.txt, words_5.txt — английские слова (5-7 букв / только 5);
+  names.txt              — личные имена (5-8 букв);
+  stopwords.txt          — слова через пробел/запятую/перенос строки.
 """
 from __future__ import annotations
 
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 # =============================================================================
@@ -32,13 +40,15 @@ DIGITS = "0123456789"
 INITIALS = "bdfgjklmnprstvz"
 
 # Финалы: распределение смещено в сторону редких букв.
-# Частые (lm nrst) — вес 2, редкие (x z j k w v u) — вес 5.
-# Это сдвигает выдачу к «свободным» именам, не ломая читаемости.
+# Частые (lmnrst) — вес 2, редкие (xzjkwv) — вес 5.
 _FINALS = "lmnrst" * 2 + "xzjkwv" * 5
 
-# Скрэмбл: расширен за счёт q, w, x, y — их раньше не было, а они самые
-# «свободные». q без u выглядит странно, но для скрэмбла это ок.
+# Скрэмбл: расширен за счёт q, w, x, y — они самые «свободные».
 _SCRAMBLE = "bcdfghjklmnprstvwxyz"
+_RARE_FIRST = "qzxjwv"
+
+# Длина имени, под которую заточены стратегии.
+DEFAULT_LENGTH = 5
 
 
 # =============================================================================
@@ -77,6 +87,7 @@ fifty fight final first fixed fleet floor fluid
 """.split()
 
 _BUILTIN_WORDS: tuple[str, ...] = tuple(dict.fromkeys(_BUILTIN_WORDS_RAW))
+_BUILTIN_SET: frozenset[str] = frozenset(_BUILTIN_WORDS)
 
 
 # =============================================================================
@@ -87,57 +98,76 @@ _BASE_DIR = Path(__file__).resolve().parent.parent
 _ASSETS = _BASE_DIR / "assets"
 
 
-def _read_lines(path: Path, lo: int, hi: int, alpha_only: bool = True) -> list[str]:
-    """Читает файл построчно, фильтрует по длине, дедуплицирует."""
+def _iter_tokens(path: Path) -> Iterable[str]:
+    """Токены файла: разделители — перенос строки, пробел, запятая, ';'."""
     if not path.is_file():
         return []
-    out: list[str] = []
     try:
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            w = line.strip().lower()
-            if not (lo <= len(w) <= hi):
-                continue
-            if alpha_only and not w.isalpha():
-                continue
-            out.append(w)
-    except Exception:
+        text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
         return []
+    return re.split(r"[\s,;]+", text.lower())
+
+
+def _read_words(path: Path, lo: int, hi: int) -> list[str]:
+    """Читает словарь, фильтрует по длине и «только латиница», дедуплицирует."""
+    out: list[str] = []
+    for w in _iter_tokens(path):
+        w = w.strip()
+        if lo <= len(w) <= hi and w.isascii() and w.isalpha():
+            out.append(w)
     return list(dict.fromkeys(out))
 
 
+# Для скоринга — все длины; для генерации — только DEFAULT_LENGTH.
 _EXT_WORDS: list[str] = []
 _EXT_NAMES: list[str] = []
-_STOPWORDS: set[str] = set()
+_EXT_WORDS_SET: frozenset[str] = frozenset()
+_EXT_NAMES_SET: frozenset[str] = frozenset()
+_STOPWORDS: frozenset[str] = frozenset()
+
+_POOL_WORDS_5: tuple[str, ...] = ()
+_POOL_NAMES_5: tuple[str, ...] = ()
+_POOL_DICT_5: tuple[str, ...] = ()
 
 
 def reload_external_dicts(use_external: bool = True) -> None:
     """
-    Перечитывает внешние словари. Стоп-слова загружаются всегда,
-    если файл есть — они отсекаются из основных пулов.
+    Перечитывает словари.
+
+    Стоп-слова загружаются ВСЕГДА (если файл есть) — они нужны и для
+    встроенного словаря. use_external=False отключает только words/names.
     """
-    global _EXT_WORDS, _EXT_NAMES, _STOPWORDS
+    global _EXT_WORDS, _EXT_NAMES, _EXT_WORDS_SET, _EXT_NAMES_SET, _STOPWORDS
+    global _POOL_WORDS_5, _POOL_NAMES_5, _POOL_DICT_5
 
-    if not use_external:
+    _STOPWORDS = frozenset(_read_words(_ASSETS / "stopwords.txt", 1, 32))
+
+    if use_external:
+        raw_words = _read_words(_ASSETS / "words.txt", 5, 8)
+        raw_words += _read_words(_ASSETS / "words_5.txt", 5, 5)
+        raw_names = _read_words(_ASSETS / "names.txt", 5, 8)
+        _EXT_WORDS = [w for w in dict.fromkeys(raw_words) if w not in _STOPWORDS]
+        _EXT_NAMES = [w for w in dict.fromkeys(raw_names) if w not in _STOPWORDS]
+    else:
         _EXT_WORDS, _EXT_NAMES = [], []
-        _STOPWORDS = set()
-        return
 
-    _STOPWORDS = set(_read_lines(_ASSETS / "stopwords.txt", 1, 20))
+    _EXT_WORDS_SET = frozenset(_EXT_WORDS)
+    _EXT_NAMES_SET = frozenset(_EXT_NAMES)
 
-    raw_words = _read_lines(_ASSETS / "words.txt", 5, 7)
-    raw_names = _read_lines(_ASSETS / "names.txt", 5, 8)
-
-    # Убираем стоп-слова из обоих пулов.
-    _EXT_WORDS = [w for w in raw_words if w not in _STOPWORDS]
-    _EXT_NAMES = [w for w in raw_names if w not in _STOPWORDS]
+    builtin_5 = [w for w in _BUILTIN_WORDS if w not in _STOPWORDS]
+    ext_5 = [w for w in _EXT_WORDS if len(w) == DEFAULT_LENGTH]
+    _POOL_WORDS_5 = tuple(dict.fromkeys(builtin_5 + ext_5))
+    _POOL_NAMES_5 = tuple(w for w in _EXT_NAMES if len(w) == DEFAULT_LENGTH)
+    _POOL_DICT_5 = _POOL_WORDS_5 + _POOL_NAMES_5
 
 
-def _words_pool() -> list[str]:
-    return [w for w in _BUILTIN_WORDS if w not in _STOPWORDS] + _EXT_WORDS
+def _is_word(name: str) -> bool:
+    return name in _BUILTIN_SET or name in _EXT_WORDS_SET
 
 
-def _names_pool() -> list[str]:
-    return _EXT_NAMES
+def _is_name(name: str) -> bool:
+    return name in _EXT_NAMES_SET
 
 
 # =============================================================================
@@ -174,8 +204,7 @@ def _gen_syllabic() -> str:
 
 
 def _gen_dictionary() -> str:
-    pool = _words_pool() + _names_pool()
-    return random.choice(pool) if pool else _gen_syllabic()
+    return random.choice(_POOL_DICT_5) if _POOL_DICT_5 else _gen_syllabic()
 
 
 # Брендовые префиксы — добавлены редкие для расширения пула.
@@ -227,20 +256,16 @@ def _gen_scramble() -> str:
     Случайное сочетание. Первой ставим редкую букву (в 60% случаев) —
     это повышает шанс попадания в свободное имя.
     """
-    # Rare-first: с вероятностью 60% первая буква — из редких.
-    if random.random() < 0.6:
-        first = random.choice("qzxjwv")
-    else:
-        first = random.choice(_SCRAMBLE)
+    first = random.choice(_RARE_FIRST) if random.random() < 0.6 else random.choice(_SCRAMBLE)
     rest = "".join(
-        random.choice(_SCRAMBLE + ("aeiou" if random.random() < 0.3 else ""))
-        for _ in range(4)
+        random.choice(_SCRAMBLE + (VOWELS if random.random() < 0.3 else ""))
+        for _ in range(DEFAULT_LENGTH - 1)
     )
     return first + rest
 
 
 def _gen_scramble_mixed() -> str:
-    return _gen_scramble()[:4] + random.choice(DIGITS)
+    return _gen_scramble()[:DEFAULT_LENGTH - 1] + random.choice(DIGITS)
 
 
 # =============================================================================
@@ -261,6 +286,11 @@ def _pick_generator() -> Callable[[], str]:
         if r < bound:
             return fn
     return _gen_syllabic
+
+
+def _gen_smart() -> str:
+    """Случайная стратегия из микса."""
+    return _pick_generator()()
 
 
 # =============================================================================
@@ -286,16 +316,16 @@ def _score_reason(name: str) -> tuple[int, str]:
     else:
         score -= 1
 
-    if name in _BUILTIN_WORDS or name in _EXT_WORDS:
+    if _is_word(name):
         score += 3
         reason = "Осмысленное английское слово"
-    elif name in _EXT_NAMES:
+    elif _is_name(name):
         score += 2
         reason = "Личное имя"
     elif _SYLLABIC_RE.match(name):
         score += 1
         reason = "Читаемое псевдослово"
-    elif "_" in name and name.replace("_", "").isalpha():
+    elif "_" in name and name.replace("_", "").isalnum():
         word_part = name.split("_", 1)[1]
         if word_part in _SHORT_WORDS or word_part.isdigit():
             score += 1
@@ -305,7 +335,7 @@ def _score_reason(name: str) -> tuple[int, str]:
     elif _RE_DIGIT.search(name):
         score -= 1
         reason = "Содержит цифры"
-    elif _RE_CONS4.search(name[:1] + name):
+    elif _RE_CONS4.search(name):
         score -= 2
         reason = "Трудное для чтения"
 
@@ -334,16 +364,6 @@ def score_username(name: str) -> tuple[int, str]:
 #                        Базовый генератор
 # =============================================================================
 
-def generate_username(length: int = 5) -> str:
-    if length != 5:
-        return _fallback(length)
-    for _ in range(30):
-        name = _pick_generator()()
-        if _is_clean(name, length) and name not in _STOPWORDS:
-            return name
-    return _fallback(length)
-
-
 def _fallback(length: int) -> str:
     if length < 2:
         return "".join(random.choice(LETTERS) for _ in range(max(1, length)))
@@ -357,49 +377,65 @@ def _fallback(length: int) -> str:
             return name
     return "".join(random.choice(LETTERS) for _ in range(length))
 
-def _gen_smart() -> str:
-    """Обёртка — вызывает случайную стратегию и возвращает готовое имя."""
-    return _pick_generator()()
 
-def generate_many(count: int, length: int = 5) -> list[str]:
-    return _generate_batch(count, length, strategy=_gen_smart)
+def generate_username(length: int = DEFAULT_LENGTH) -> str:
+    if length != DEFAULT_LENGTH:
+        return _fallback(length)
+    for _ in range(30):
+        name = _gen_smart()
+        if _is_clean(name, length) and name not in _STOPWORDS:
+            return name
+    return _fallback(length)
 
 
-def generate_many_random(count: int, length: int = 5) -> list[str]:
-    if length != 5:
-        return _generate_batch(count, length, strategy=lambda: _fallback(length))
-    return _generate_batch(
-        count,
-        length,
-        strategy=lambda: _gen_scramble_mixed()
-        if random.random() < 0.15
-        else _gen_scramble(),
-    )
+def generate_many(
+    count: int,
+    length: int = DEFAULT_LENGTH,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Осмысленные имена. exclude — что не предлагать (уже проверенные)."""
+    if length != DEFAULT_LENGTH:
+        return _generate_batch(count, length, lambda: _fallback(length), exclude)
+    return _generate_batch(count, length, _gen_smart, exclude)
+
+
+def generate_many_random(
+    count: int,
+    length: int = DEFAULT_LENGTH,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Случайные сочетания. exclude — что не предлагать."""
+    if length != DEFAULT_LENGTH:
+        return _generate_batch(count, length, lambda: _fallback(length), exclude)
+
+    def strategy() -> str:
+        return _gen_scramble_mixed() if random.random() < 0.15 else _gen_scramble()
+
+    return _generate_batch(count, length, strategy, exclude)
 
 
 def _generate_batch(
     count: int,
     length: int,
     strategy: Callable[[], str],
+    exclude: set[str] | None = None,
 ) -> list[str]:
     if count <= 0:
         return []
+    skip = exclude or set()
     result: list[str] = []
     seen: set[str] = set()
-    cap = count * 40
     attempts = 0
+    cap = count * 60
     while len(result) < count and attempts < cap:
-        for _ in range(max(10, (count - len(result)) * 2)):
-            attempts += 1
-            name = strategy()
-            if name in seen or not _is_clean(name, length):
-                continue
-            if name in _STOPWORDS:
-                continue
-            seen.add(name)
-            result.append(name)
-            if len(result) >= count:
-                break
+        attempts += 1
+        name = strategy()
+        if name in seen or name in skip:
+            continue
+        if not _is_clean(name, length) or name in _STOPWORDS:
+            continue
+        seen.add(name)
+        result.append(name)
     return result
 
 
@@ -415,9 +451,14 @@ _SIMILAR_MAP: dict[str, str] = {
 }
 
 _POPULAR_TAILS = "xyzlnrstmv"
+_TAIL_PAIRS = (
+    "ix", "ex", "ax", "ox", "us", "io", "on", "an", "en", "er", "ly",
+    "zz", "xx", "ox", "os", "is", "ik", "ek", "ak", "ov", "ev",
+)
+_HEAD_LETTERS = "ixoeuz"
 
 
-def _transform_substitute(base: str) -> set[str]:
+def _t_substitute(base: str) -> set[str]:
     out: set[str] = set()
     for i, ch in enumerate(base):
         alt = _SIMILAR_MAP.get(ch)
@@ -426,25 +467,20 @@ def _transform_substitute(base: str) -> set[str]:
     return out
 
 
-def _transform_swap(base: str) -> set[str]:
+def _t_swap(base: str) -> set[str]:
+    return {
+        base[:i] + base[i + 1] + base[i] + base[i + 2:]
+        for i in range(len(base) - 1)
+    }
+
+
+def _t_last(base: str) -> set[str]:
+    return {base[:-1] + ch for ch in _POPULAR_TAILS if ch != base[-1]}
+
+
+def _t_first(base: str) -> set[str]:
     out: set[str] = set()
-    for i in range(len(base) - 1):
-        out.add(base[:i] + base[i + 1] + base[i] + base[i + 2:])
-    return out
-
-
-def _transform_last(base: str) -> set[str]:
-    out: set[str] = set()
-    for ch in _POPULAR_TAILS:
-        if ch != base[-1]:
-            out.add(base[:-1] + ch)
-    return out
-
-
-def _transform_first(base: str) -> set[str]:
-    out: set[str] = set()
-    first = base[0]
-    idx = LETTERS.find(first)
+    idx = LETTERS.find(base[0])
     if idx > 0:
         out.add(LETTERS[idx - 1] + base[1:])
     if idx < len(LETTERS) - 1:
@@ -452,64 +488,131 @@ def _transform_first(base: str) -> set[str]:
     return out
 
 
-def _transform_vowel_inject(base: str) -> set[str]:
+def _t_vowel_replace(base: str) -> set[str]:
     out: set[str] = set()
     for i in range(1, len(base) - 1):
-        if base[i] not in VOWELS:
+        if base[i] in VOWELS:
             for v in VOWELS:
-                out.add(base[:i] + v + base[i + 1:])
+                if v != base[i]:
+                    out.add(base[:i] + v + base[i + 1:])
     return out
 
 
-def _transform_shorten(base: str) -> set[str]:
+def _t_shorten(base: str) -> set[str]:
+    """Убираем по одной гласной (кроме первой буквы)."""
+    return {
+        base[:i] + base[i + 1:]
+        for i, ch in enumerate(base)
+        if i > 0 and ch in VOWELS
+    }
+
+
+def _t_grow_one(base: str) -> set[str]:
+    """Все варианты длиннее на один символ: вставка гласной, удвоение, хвост, голова."""
     out: set[str] = set()
+    for i in range(1, len(base) + 1):
+        for v in VOWELS:
+            out.add(base[:i] + v + base[i:])
     for i, ch in enumerate(base):
-        if ch in VOWELS:
-            out.add(base[:i] + base[i + 1:])
+        if ch.isalpha():
+            out.add(base[: i + 1] + ch + base[i + 1:])        # удвоение буквы
+    for ch in _POPULAR_TAILS:
+        out.add(base + ch)
+    for ch in _HEAD_LETTERS:
+        out.add(ch + base)
     return out
 
 
-def _transform_lengthen(base: str) -> set[str]:
+def _t_grow_two(base: str) -> set[str]:
+    return {base + pair for pair in _TAIL_PAIRS}
+
+
+def _same_length_variants(base: str) -> set[str]:
     out: set[str] = set()
-    for i in range(1, len(base)):
-        out.add(base[:i] + random.choice(VOWELS) + base[i:])
+    for fn in (_t_substitute, _t_swap, _t_last, _t_first, _t_vowel_replace):
+        out.update(fn(base))
     return out
 
 
-def generate_similar(base: str, count: int = 20, length: int | None = None) -> list[str]:
+def generate_similar(
+    base: str,
+    count: int = 20,
+    length: int | None = None,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """
+    Детерминированный список вариантов, похожих на base.
+
+    exclude — имена, которые уже проверялись: их не возвращаем, поэтому
+    повторные вызовы с растущим exclude выдают НОВЫЕ кандидаты, а когда
+    варианты закончатся — пустой список (вызывающий код должен это
+    обрабатывать, а не крутиться в цикле).
+    """
     base = base.lstrip("@").strip().lower()
-    if not base or not base.isalpha():
+    if not base or not (base.isascii() and base.isalpha()):
         return []
 
     if length is None:
-        length = 5 if len(base) <= 5 else len(base)
+        length = DEFAULT_LENGTH if len(base) <= DEFAULT_LENGTH else len(base)
+    skip = set(exclude or ())
 
-    candidates: set[str] = set()
-    for fn in (
-        _transform_substitute, _transform_swap, _transform_last,
-        _transform_first, _transform_vowel_inject,
-    ):
-        if len(base) == length:
-            candidates.update(fn(base))
+    # Уровень 1: приводим к нужной длине.
+    level1: set[str]
+    if len(base) == length:
+        level1 = _same_length_variants(base)
+    elif len(base) < length:
+        grown = {base}
+        for _ in range(length - len(base)):
+            step: set[str] = set()
+            for g in grown:
+                if len(g) >= length:
+                    step.add(g)
+                    continue
+                step.update(_t_grow_one(g))
+                if length - len(g) == 2:
+                    step.update(_t_grow_two(g))
+            grown = step
+        level1 = {g for g in grown if len(g) == length}
+    else:
+        shrunk = {base}
+        for _ in range(len(base) - length):
+            shrunk = {x for s in shrunk for x in _t_shorten(s)}
+        level1 = {s for s in shrunk if len(s) == length}
 
-    if len(base) < length:
-        candidates.update(_transform_lengthen(base))
-        for x in list(candidates):
-            if len(x) < length:
-                candidates.add(x + random.choice(_POPULAR_TAILS))
-    elif len(base) > length:
-        candidates.update(_transform_shorten(base))
+    def _clean(cands: Iterable[str]) -> list[str]:
+        return [
+            c for c in cands
+            if c != base and c not in skip and c.isalpha()
+            and _is_clean(c, length) and c not in _STOPWORDS
+        ]
 
-    clean = [
-        c for c in candidates
-        if c != base and _is_clean(c, length) and c.isalpha()
-        and c not in _STOPWORDS
-    ]
-    clean.sort(key=lambda x: (
-        0 if x in _BUILTIN_WORDS or x in _EXT_WORDS else 1,
-        len(x),
-    ))
-    return clean[: max(1, count)]
+    candidates = set(_clean(level1))
+
+    # Уровень 2: если мало — варьируем уже полученные (соседние формы).
+    if len(candidates) < count:
+        level2: set[str] = set()
+        for c in list(level1)[:200]:
+            if len(c) == length:
+                level2.update(_same_length_variants(c))
+        candidates.update(_clean(level2))
+
+    def _prefix_match(x: str) -> int:
+        n = 0
+        for a, b in zip(x, base):
+            if a != b:
+                break
+            n += 1
+        return n
+
+    ordered = sorted(
+        candidates,
+        key=lambda x: (
+            0 if _is_word(x) else (1 if _is_name(x) else 2),
+            -_prefix_match(x),
+            x,
+        ),
+    )
+    return ordered[: max(1, count)]
 
 
 # =============================================================================
@@ -517,7 +620,8 @@ def generate_similar(base: str, count: int = 20, length: int | None = None) -> l
 # =============================================================================
 
 def dictionary_size() -> tuple[int, int]:
-    return len(_words_pool()), len(_names_pool())
+    """(слов для генерации, имён для генерации) — только 5-буквенные."""
+    return len(_POOL_WORDS_5), len(_POOL_NAMES_5)
 
 
 def stopwords_count() -> int:
@@ -527,7 +631,7 @@ def stopwords_count() -> int:
 if __name__ == "__main__":
     reload_external_dicts()
     w, n = dictionary_size()
-    print(f"Словарь: {w} слов, {n} имён, {stopwords_count()} стоп-слов\n")
+    print(f"Пул генерации: {w} слов, {n} имён; стоп-слов: {stopwords_count()}\n")
 
     print("=== Смешанный (примеры) ===")
     for i, name in enumerate(generate_many(15), 1):
@@ -538,3 +642,7 @@ if __name__ == "__main__":
     for i, name in enumerate(generate_many_random(8), 1):
         sc, why = score_username(name)
         print(f"  {i}. {name:8}  {sc}/10  ·  {why}")
+
+    print("\n=== Похожие ===")
+    for b in ("abc", "alex", "vital", "vitaly"):
+        print(f"  {b:8} → {generate_similar(b, count=10)}")

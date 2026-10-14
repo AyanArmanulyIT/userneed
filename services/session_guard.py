@@ -3,7 +3,8 @@ Session Guard — сторож активных Telethon-сессий.
 
 Раз в CHECK_INTERVAL проверяет каждую сессию через is_user_authorized().
 Если сессия разлогинена — пытается восстановить через reconnect.
-Если не помогает — уведомляет админов и продолжает работать на живых.
+Если не помогает — уведомляет админов (не чаще ALERT_COOLDOWN на сессию)
+и продолжает работать на живых.
 
 Это спасает от сценария «всё нормально в логах, но бот молча не работает».
 """
@@ -23,15 +24,19 @@ logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL = 1800          # 30 минут
 ALERT_COOLDOWN = 3600          # не спамить чаще часа об одной и той же сессии
+STARTUP_DELAY = 60
+
+_LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
 @dataclass
 class _SessionState:
     name: str
     client: TelegramClient
-    last_alert_at: float = 0.0
+    last_alert_at: float | None = None     # None — ещё ни разу не алертили
     dead_since: float = 0.0
     was_dead: bool = False
+    recoveries: int = 0
 
 
 class SessionGuard:
@@ -56,7 +61,7 @@ class SessionGuard:
 
     def start(self) -> None:
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop())
+            self._task = asyncio.create_task(self._loop(), name="session-guard")
             logger.info("Session Guard запущен: %d сессий", len(self._sessions))
 
     async def stop(self) -> None:
@@ -66,21 +71,33 @@ class SessionGuard:
                 await self._task
 
     async def _loop(self) -> None:
-        # Даём боту стартовать.
-        await asyncio.sleep(60)
+        await asyncio.sleep(STARTUP_DELAY)
         while True:
             try:
                 await self._check_all()
             except asyncio.CancelledError:
-                return
-            except Exception:
+                raise
+            except Exception:  # noqa: BLE001 — сторож не должен умирать
                 logger.exception("Session Guard: ошибка в цикле")
             await asyncio.sleep(CHECK_INTERVAL)
 
+    async def check_now(self) -> None:
+        """Внеплановая проверка (для админ-команд)."""
+        await self._check_all()
+
     async def _check_all(self) -> None:
-        """Проверяет каждую сессию. Мёртвых — пытается восстановить."""
+        """
+        Проверяет каждую сессию. Мёртвую сначала пытается восстановить,
+        и только если не вышло — считает мёртвой и алертит (с кулдауном).
+        """
         for s in self._sessions:
             alive = await self._is_alive(s)
+            if not alive:
+                alive = await self._try_recover(s)
+                if alive:
+                    s.recoveries += 1
+                    logger.info("Сессия %r переподключена.", s.name)
+
             if alive:
                 if s.was_dead:
                     logger.info("Сессия %r восстановлена.", s.name)
@@ -88,25 +105,21 @@ class SessionGuard:
                     s.dead_since = 0.0
                 continue
 
-            # Умерла.
+            now = time.monotonic()
             if not s.was_dead:
                 s.was_dead = True
-                s.dead_since = time.monotonic()
+                s.dead_since = now
                 logger.warning("Сессия %r не авторизована.", s.name)
+
+            if s.last_alert_at is None or now - s.last_alert_at > ALERT_COOLDOWN:
+                s.last_alert_at = now
                 await self._alert_dead(s)
-            # Пока не восстановилась — пытаемся что-то сделать.
-            if not await self._try_recover(s):
-                # Не восстановилась — алерт не чаще раза в час.
-                now = time.monotonic()
-                if now - s.last_alert_at > ALERT_COOLDOWN:
-                    s.last_alert_at = now
-                    await self._alert_dead(s)
 
     async def _is_alive(self, s: _SessionState) -> bool:
         try:
             if not s.client.is_connected():
                 await s.client.connect()
-            return await s.client.is_user_authorized()
+            return bool(await s.client.is_user_authorized())
         except Exception as exc:  # noqa: BLE001
             logger.debug("Проверка сессии %r: %s", s.name, exc)
             return False
@@ -118,7 +131,7 @@ class SessionGuard:
                 await s.client.disconnect()
             await asyncio.sleep(2)
             await s.client.connect()
-            return await s.client.is_user_authorized()
+            return bool(await s.client.is_user_authorized())
         except Exception as exc:  # noqa: BLE001
             logger.debug("Recover %r: %s", s.name, exc)
             return False
@@ -127,7 +140,7 @@ class SessionGuard:
         """Уведомляет админов о мёртвой сессии."""
         text = (
             f"<b>SESSION GUARD · ВНИМАНИЕ</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{_LINE}\n\n"
             f"Сессия <code>{s.name}</code> не отвечает.\n"
             f"Причина: разлогинена или заблокирована.\n\n"
             f"<b>Что делать:</b>\n"
@@ -144,18 +157,18 @@ class SessionGuard:
                     admin_id, text, parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.exception("Session Guard: не доставлено админу %s", admin_id)
 
     def snapshot(self) -> list[dict[str, object]]:
         """Для /stats — короткая сводка."""
+        now = time.monotonic()
         return [
             {
                 "name": s.name,
                 "alive": not s.was_dead,
-                "dead_since_sec": (
-                    int(time.monotonic() - s.dead_since) if s.was_dead else 0
-                ),
+                "dead_since_sec": int(now - s.dead_since) if s.was_dead else 0,
+                "recoveries": s.recoveries,
             }
             for s in self._sessions
-        ]   
+        ]

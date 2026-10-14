@@ -5,7 +5,8 @@ DailyReporter — суточная сводка админам.
 дельты счётчиков чекера, состояние сессий, watchlist.
 
 Работает параллельно боту в отдельной asyncio.task. Метка последней
-отправки лежит в last_report.txt — при рестарте не отправляет дубликат.
+отправки лежит в state_file (last_report.txt в data_dir) — при рестарте
+не отправляет дубликат.
 """
 from __future__ import annotations
 
@@ -26,7 +27,9 @@ from services.watchlist import Watchlist
 logger = logging.getLogger(__name__)
 
 REPORT_INTERVAL = 86400              # раз в сутки
-LAST_REPORT_FILE = Path("last_report.txt")
+CHECK_EVERY = 3600                   # как часто смотрим, не пора ли
+STARTUP_DELAY = 120
+DEFAULT_STATE_FILE = Path("last_report.txt")
 
 _LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -40,6 +43,8 @@ class DailyReporter:
         storage: FoundStorage,
         watchlist: Watchlist,
         guard: SessionGuard,
+        *,
+        state_file: Path | None = None,
     ) -> None:
         self._bot = bot
         self._admins = tuple(admin_ids)
@@ -47,6 +52,7 @@ class DailyReporter:
         self._storage = storage
         self._watchlist = watchlist
         self._guard = guard
+        self._state_file = state_file or DEFAULT_STATE_FILE
         self._task: asyncio.Task | None = None
         # Снапшот счётчиков чекера — в отчёте покажем ДЕЛЬТУ за период.
         self._start_snapshot = dict(checker.stats)
@@ -54,10 +60,9 @@ class DailyReporter:
 
     def start(self) -> None:
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop())
+            self._task = asyncio.create_task(self._loop(), name="daily-report")
             logger.info(
-                "DailyReporter запущен (интервал %d ч)",
-                REPORT_INTERVAL // 3600,
+                "DailyReporter запущен (интервал %d ч)", REPORT_INTERVAL // 3600,
             )
 
     async def stop(self) -> None:
@@ -67,23 +72,23 @@ class DailyReporter:
                 await self._task
 
     async def _loop(self) -> None:
-        await asyncio.sleep(120)     # даём боту стартовать
+        await asyncio.sleep(STARTUP_DELAY)
         while True:
             try:
-                if await self._should_send():
+                if self._should_send():
                     await self.send_now()
             except asyncio.CancelledError:
-                return
-            except Exception:
+                raise
+            except Exception:  # noqa: BLE001 — цикл не должен умирать
                 logger.exception("DailyReporter: ошибка в цикле")
-            await asyncio.sleep(3600)   # раз в час проверяем, надо ли
+            await asyncio.sleep(CHECK_EVERY)
 
-    async def _should_send(self) -> bool:
-        if not LAST_REPORT_FILE.is_file():
+    def _should_send(self) -> bool:
+        if not self._state_file.is_file():
             return True
         try:
-            last = float(LAST_REPORT_FILE.read_text().strip())
-        except Exception:
+            last = float(self._state_file.read_text().strip())
+        except (OSError, ValueError):
             return True
         return (time.time() - last) >= REPORT_INTERVAL
 
@@ -97,13 +102,12 @@ class DailyReporter:
                     admin_id, text, parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            except Exception:
-                logger.exception(
-                    "DailyReporter: не доставлено админу %s", admin_id
-                )
+            except Exception:  # noqa: BLE001
+                logger.exception("DailyReporter: не доставлено админу %s", admin_id)
         try:
-            LAST_REPORT_FILE.write_text(str(time.time()))
-        except Exception:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._state_file.write_text(str(time.time()))
+        except OSError:
             logger.exception("DailyReporter: не могу записать метку")
 
         # Сброс периода: следующая сводка считается от текущего момента.
@@ -117,12 +121,11 @@ class DailyReporter:
         cur = self._checker.stats
         delta = {
             k: cur.get(k, 0) - self._start_snapshot.get(k, 0)
-            for k in ("free", "taken", "fragment",
-                      "http_short_circuit", "floods")
+            for k in ("free", "taken", "fragment", "http_short_circuit",
+                      "cache_hits", "floods", "error")
         }
 
-        records = self._storage.recent(user_id=None, days=1, limit=100000)
-        unique_users = len({r.found_by for r in records if r.found_by})
+        records, unique_users = self._storage.count_since(days=1)
 
         gsnap = self._guard.snapshot()
         alive = sum(1 for s in gsnap if s["alive"])
@@ -136,13 +139,15 @@ class DailyReporter:
             "",
             "<b>ПОЛЬЗОВАТЕЛИ</b>",
             f"    уникальных:    <b>{unique_users}</b>",
-            f"    находок всего: <b>{len(records)}</b>",
+            f"    находок всего: <b>{records}</b>",
             "",
             "<b>ПРОВЕРКИ (дельта за период)</b>",
             f"    свободных:     <b>{delta['free']}</b>",
             f"    за TON:        <b>{delta['fragment']}</b>",
             f"    занятых:       <b>{delta['taken']}</b>",
             f"    HTTP-отсев:    <b>{delta['http_short_circuit']}</b>",
+            f"    из кэша:       <b>{delta['cache_hits']}</b>",
+            f"    ошибок:        <b>{delta['error']}</b>",
             "",
             "<b>СЕССИИ</b>",
             f"    живых:         <b>{alive} / {len(gsnap)}</b>",
@@ -152,4 +157,4 @@ class DailyReporter:
             f"    позиций:       <b>{wb['total']}</b>",
             f"    свежих:        <b>{wb['hot']}</b>",
         ]
-        return "\n".join(lines)             
+        return "\n".join(lines)

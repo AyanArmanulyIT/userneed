@@ -1,13 +1,18 @@
 """
-Watchlist — фоновый монитор избранных username'ов.
+Watchlist — фоновый монитор избранных username'ов (watchlist.db).
 
 Приоритезация (экономит 60-70% MTProto-запросов):
-  • hot   — добавлено < 1 дня    → проверять каждый WATCH_HOT_INTERVAL
-  • warm  — добавлено < 7 дней   → проверять каждый WATCH_WARM_INTERVAL
-  • cold  — добавлено >= 7 дней  → проверять каждый WATCH_COLD_INTERVAL
-  • sleeping — status='taken' и не менялся N дней → не проверяется
+  • hot      — добавлено < 1 дня    → проверять каждый WATCH_HOT_INTERVAL
+  • warm     — добавлено < 7 дней   → проверять каждый WATCH_WARM_INTERVAL
+  • cold     — добавлено >= 7 дней  → проверять каждый WATCH_COLD_INTERVAL
+  • sleeping — status='taken' и не менялся N дней, либо 'invalid' →
+               не проверяется (next_check_at = 0)
+
+Ошибки проверки («error», исключения, флуд) НЕ перезаписывают статус
+позиции: она остаётся с прежним статусом и уходит на короткий повтор.
 
 Работает параллельно боту — отдельная asyncio.task, отдельная SQLite-база.
+Модуль доступен только администраторам (is_admin).
 """
 from __future__ import annotations
 
@@ -22,11 +27,22 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.enums import ParseMode
 
-from services.checker import TelegramChecker
+from services.checker import AllSessionsFloodedError, TelegramChecker
 
 logger = logging.getLogger(__name__)
 
-_DB_PATH = Path(__file__).resolve().parent.parent / "watchlist.db"
+# Путь по умолчанию — корень проекта (рядом с config.py). main.py передаёт
+# явный путь из конфига; этот нужен только для обратной совместимости.
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "watchlist.db"
+
+RETRY_AFTER_ERROR = 900        # повтор после ошибки проверки, сек
+STARTUP_DELAY = 60             # даём боту стартовать
+LOOP_INTERVAL = 60             # пауза между волнами
+HEARTBEAT_INTERVAL = 3600
+MAX_CONSECUTIVE_ERRORS = 5
+ERROR_BACKOFF = 600
+
+_LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
 # =============================================================================
@@ -71,6 +87,7 @@ class Watchlist:
         cold_interval: int = 86400,
         batch_size: int = 30,
         sleep_after_days: int = 20,
+        path: Path | str | None = None,
     ) -> None:
         self._checker = checker
         self._bot = bot
@@ -83,9 +100,11 @@ class Watchlist:
         self._sleep_after = max(1, sleep_after_days)
 
         self._task: asyncio.Task | None = None
-        self._db = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        self._path = Path(path) if path is not None else _DEFAULT_DB_PATH
+        self._db = sqlite3.connect(self._path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._init_schema()
+        logger.info("Watchlist: база %s", self._path)
 
     # --- Схема ---------------------------------------------------------------
 
@@ -107,10 +126,14 @@ class Watchlist:
                     ON targets (next_check_at)
             """)
 
+    @staticmethod
+    def _norm(username: str) -> str:
+        return username.lstrip("@").strip().lower()
+
     # --- Управление списком --------------------------------------------------
 
     def add(self, username: str) -> bool:
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
         if not username:
             return False
         now = time.time()
@@ -125,19 +148,22 @@ class Watchlist:
                     (username, now, now),
                 )
             return cur.rowcount > 0
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.exception("watchlist.add(%s): %s", username, exc)
             return False
 
     def remove(self, username: str) -> bool:
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
+        if not username:
+            return False
         try:
             with self._db:
                 cur = self._db.execute(
                     "DELETE FROM targets WHERE username = ?", (username,),
                 )
             return cur.rowcount > 0
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.exception("watchlist.remove(%s): %s", username, exc)
             return False
 
     def all_targets(self) -> list[tuple[str, str]]:
@@ -146,14 +172,16 @@ class Watchlist:
                 "SELECT username, status FROM targets ORDER BY username"
             )
             return [(r["username"], r["status"]) for r in cur.fetchall()]
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.exception("watchlist.all_targets: %s", exc)
             return []
 
     def count(self) -> int:
         try:
             cur = self._db.execute("SELECT COUNT(*) FROM targets")
             return int(cur.fetchone()[0])
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.exception("watchlist.count: %s", exc)
             return 0
 
     def breakdown(self) -> dict[str, int]:
@@ -179,8 +207,8 @@ class Watchlist:
                     out["warm"] += 1
                 else:
                     out["cold"] += 1
-        except Exception:
-            pass
+        except sqlite3.Error as exc:
+            logger.exception("watchlist.breakdown: %s", exc)
         return out
 
     # --- Права ---------------------------------------------------------------
@@ -192,7 +220,7 @@ class Watchlist:
 
     def start(self) -> None:
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop())
+            self._task = asyncio.create_task(self._loop(), name="watchlist")
             b = self.breakdown()
             logger.info(
                 "Watchlist запущен: всего %d позиций (hot=%d, warm=%d, "
@@ -205,22 +233,17 @@ class Watchlist:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-        try:
+        with contextlib.suppress(sqlite3.Error):
             self._db.close()
-        except Exception:
-            pass
 
     # --- Фоновый цикл --------------------------------------------------------
 
     async def _loop(self) -> None:
         """
-        Фоновый цикл с защитой от падения.
-
-        Если что-то упадёт внутри _scan_once — не убиваем задачу,
-        а логируем и продолжаем. Каждый час пишем heartbeat в лог,
-        чтобы было видно, что таск жив.
+        Фоновый цикл с защитой от падения: ошибка внутри волны логируется,
+        задача живёт дальше. Раз в час — heartbeat в лог.
         """
-        await asyncio.sleep(60)   # даём боту стартовать
+        await asyncio.sleep(STARTUP_DELAY)
         consecutive_errors = 0
         last_heartbeat = time.time()
 
@@ -230,51 +253,51 @@ class Watchlist:
                 consecutive_errors = 0
             except asyncio.CancelledError:
                 logger.info("Watchlist: остановлен")
-                return
-            except Exception as exc:
+                raise
+            except Exception as exc:  # noqa: BLE001 — сторож не должен умирать
                 consecutive_errors += 1
                 logger.exception(
-                    "Watchlist: ошибка (подряд %d): %s",
-                    consecutive_errors, exc,
+                    "Watchlist: ошибка (подряд %d): %s", consecutive_errors, exc,
                 )
-                if consecutive_errors >= 5:
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     logger.error(
-                        "Watchlist: 5 ошибок подряд — пауза 10 минут."
+                        "Watchlist: %d ошибок подряд — пауза %d с.",
+                        MAX_CONSECUTIVE_ERRORS, ERROR_BACKOFF,
                     )
-                    await asyncio.sleep(600)
+                    await asyncio.sleep(ERROR_BACKOFF)
                     consecutive_errors = 0
 
-            # Раз в час — heartbeat, чтобы видеть, что таск жив.
             now = time.time()
-            if now - last_heartbeat >= 3600:
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 last_heartbeat = now
-                try:
-                    cnt = self.count()
-                    logger.info("Watchlist heartbeat: %d позиций в списке", cnt)
-                except Exception:
-                    logger.exception("Watchlist: heartbeat failed")
+                logger.info("Watchlist heartbeat: %d позиций в списке", self.count())
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(LOOP_INTERVAL)
+
+    def _due_rows(self, now: float) -> list[dict]:
+        cur = self._db.execute(
+            """
+            SELECT username, status, added_at, last_check, last_change
+            FROM targets
+            WHERE next_check_at > 0 AND next_check_at <= ?
+            ORDER BY next_check_at ASC
+            LIMIT ?
+            """,
+            (now, self._batch),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
     async def _scan_once(self) -> None:
-        """Одна волна проверки "созревших" позиций."""
-        now = time.time()
-        try:
-            cur = self._db.execute(
-                """
-                SELECT username, status, added_at, last_check, last_change
-                FROM targets
-                WHERE next_check_at > 0 AND next_check_at <= ?
-                ORDER BY next_check_at ASC
-                LIMIT ?
-                """,
-                (now, self._batch),
-            )
-            rows = [dict(r) for r in cur.fetchall()]
-        except Exception:
-            logger.exception("Watchlist: ошибка выборки")
+        """Одна волна проверки «созревших» позиций."""
+        if not self._checker.has_available_session():
+            logger.debug("Watchlist: все сессии на паузе, волну пропускаем")
             return
 
+        try:
+            rows = self._due_rows(time.time())
+        except sqlite3.Error:
+            logger.exception("Watchlist: ошибка выборки")
+            return
         if not rows:
             return
 
@@ -285,13 +308,22 @@ class Watchlist:
 
             try:
                 new_status = await self._checker.check(username)
-            except Exception as exc:      # noqa: BLE001
-                logger.warning("Watchlist: @%s — %s", username, exc)
-                self._update_row(
-                    username,
-                    old_status,
-                    next_check_at=time.time() + 900,
+            except AllSessionsFloodedError as exc:
+                logger.warning(
+                    "Watchlist: все сессии во флуде (~%d с) — волна прервана.",
+                    exc.seconds_until_next,
                 )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Watchlist: @%s — %s", username, exc)
+                self._postpone(username, RETRY_AFTER_ERROR)
+                continue
+
+            if new_status == "error":
+                # Временный сбой: статус не трогаем, повторим позже.
+                self._postpone(username, RETRY_AFTER_ERROR)
                 continue
 
             self._update_row(username, new_status)
@@ -299,54 +331,55 @@ class Watchlist:
             if new_status == "free" and old_status != "free":
                 await self._notify_free(username)
 
-    def _update_row(
-        self,
-        username: str,
-        status: str,
-        next_check_at: float | None = None,
-    ) -> None:
+    # --- Обновление строк ----------------------------------------------------
+
+    def _postpone(self, username: str, seconds: int) -> None:
+        """Сдвигает следующую проверку, не меняя статус."""
+        now = time.time()
+        try:
+            with self._db:
+                self._db.execute(
+                    "UPDATE targets SET last_check = ?, next_check_at = ? "
+                    "WHERE username = ?",
+                    (now, now + seconds, username),
+                )
+        except sqlite3.Error:
+            logger.exception("Watchlist: _postpone(%s)", username)
+
+    def _update_row(self, username: str, status: str) -> None:
         """
-        Обновляет строку.
-        Если next_check_at=None — пересчитывает из правил приоритезации.
-        Если status сменился — сбрасывает last_change и уведомление.
+        Записывает новый статус и пересчитывает next_check_at.
+        При смене статуса обновляет last_change и сбрасывает флаг уведомления.
         """
         now = time.time()
         try:
             cur = self._db.execute(
-                "SELECT added_at, status, last_change FROM targets WHERE username = ?",
+                "SELECT added_at, status, last_change, notified "
+                "FROM targets WHERE username = ?",
                 (username,),
             )
             row = cur.fetchone()
             if row is None:
                 return
-            added_at = row["added_at"]
-            old_status = row["status"]
-            last_change = row["last_change"]
 
-            if status != old_status:
-                last_change = now
-                notified_reset = "notified = 0,"
-            else:
-                notified_reset = ""
-
-            if next_check_at is None:
-                next_check_at = self._compute_next_check(
-                    status, last_change, added_at, now
-                )
-                if status != "free":
-                    notified_reset = "notified = 0,"
+            changed = status != row["status"]
+            last_change = now if changed else row["last_change"]
+            notified = 0 if changed else row["notified"]
+            next_check_at = self._compute_next_check(
+                status, last_change, row["added_at"], now
+            )
 
             with self._db:
                 self._db.execute(
-                    f"""
+                    """
                     UPDATE targets
                     SET status = ?, last_check = ?, last_change = ?,
-                        next_check_at = ?, {notified_reset} username = username
+                        next_check_at = ?, notified = ?
                     WHERE username = ?
                     """,
-                    (status, now, last_change, next_check_at, username),
+                    (status, now, last_change, next_check_at, notified, username),
                 )
-        except Exception:
+        except sqlite3.Error:
             logger.exception("Watchlist: _update_row(%s)", username)
 
     def _compute_next_check(
@@ -357,10 +390,12 @@ class Watchlist:
         now: float,
     ) -> float:
         """
-        Возвращает unixtime следующей проверки.
-        0.0 (никогда) — если позиция ушла «спать»:
-        статус taken и не менялся sleep_after_days.
+        Unixtime следующей проверки. 0.0 (никогда) — позиция «уснула»:
+          • invalid — формат не изменится;
+          • taken, не менявшийся sleep_after_days.
         """
+        if status == "invalid":
+            return 0.0
         if status == "taken":
             quiet_days = (now - last_change) / 86400 if last_change else 0
             if quiet_days > self._sleep_after:
@@ -373,14 +408,15 @@ class Watchlist:
             interval = self._warm
         else:
             interval = self._cold
-
         return now + interval
 
+    # --- Уведомления ---------------------------------------------------------
+
     async def _notify_free(self, username: str) -> None:
-        """Отправляет сигнал всем админам."""
+        """Отправляет сигнал всем админам и помечает позицию уведомлённой."""
         text = (
             f"<b>WATCHLIST · ОСВОБОДИЛСЯ ИДЕНТИФИКАТОР</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{_LINE}\n\n"
             f"<code>@{username}</code>  —  <b>свободен</b>\n\n"
             f"Успейте занять: <a href=\"https://t.me/{username}\">t.me/{username}</a>"
         )
@@ -390,22 +426,14 @@ class Watchlist:
                     admin_id, text, parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 — доставка не должна ронять цикл
                 logger.exception("Watchlist: сигнал не доставлен %s", admin_id)
 
         try:
             with self._db:
                 self._db.execute(
-                    "UPDATE watchlist SET notified = 1 WHERE username = ?",
+                    "UPDATE targets SET notified = 1 WHERE username = ?",
                     (username,),
                 )
-        except Exception:
-            # Имя таблицы — targets, оставим совместимость:
-            try:
-                with self._db:
-                    self._db.execute(
-                        "UPDATE targets SET notified = 1 WHERE username = ?",
-                        (username,),
-                    )
-            except Exception:
-                pass
+        except sqlite3.Error:
+            logger.exception("Watchlist: не удалось отметить notified (%s)", username)
