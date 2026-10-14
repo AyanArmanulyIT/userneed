@@ -940,8 +940,10 @@ def service_state(
 
 
 QUOTA_USAGE_HINT = (
-    "Формат: <code>/quota &lt;user_id&gt;</code> — посмотреть, "
-    "<code>/quota_reset &lt;user_id&gt;</code> — обнулить использованные сеансы."
+    "Формат:\n"
+    "  <code>/quota &lt;user_id&gt;</code> — посмотреть;\n"
+    "  <code>/quota_reset &lt;user_id&gt;</code> — обнулить использованные сеансы;\n"
+    "  <code>/quota_add &lt;user_id&gt; &lt;n&gt;</code> — добавить n сеансов."
 )
 
 
