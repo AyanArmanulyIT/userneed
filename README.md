@@ -420,6 +420,7 @@ HTTP-отсев, попадания в кэш, флуды, ошибки), раз
 ```bash
 pip install -r requirements.txt
 python -m config                     # проверка конфига
+python selfcheck.py                  # проверка, что все файлы одной ревизии
 python -m pyflakes .                 # статический анализ — должно быть чисто
 python -m services.generator         # самопроверка генератора (словари, скоринг, «похожие»)
 python main.py
@@ -428,6 +429,10 @@ python main.py
 Правила кода — в [PROJECT.md](PROJECT.md): type hints, `from __future__ import annotations`,
 `logging.getLogger(__name__)` вместо `print`, комментарии на русском, конкретные исключения,
 **ни одной пользовательской строки вне `bot/branding.py`**.
+
+Если файлы переносились вручную и что-то не обновилось, `python selfcheck.py`
+покажет устаревшие модули и завершится с кодом 1 — это быстрее, чем ловить
+`TypeError` на старте.
 
 Зависимости: `aiogram>=3.7`, `telethon>=1.36`, `aiohttp`, `aiosqlite`, `python-dotenv`, `qrcode[pil]`.
 

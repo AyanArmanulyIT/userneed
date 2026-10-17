@@ -250,6 +250,50 @@ class TelegramChecker:
             await self._http.close()
         self._http = None
 
+    # ----- Живые настройки (панель /params) ---------------------------------
+
+    def apply_runtime(
+        self,
+        *,
+        retries: int | None = None,
+        concurrency: int | None = None,
+        delay_min: float | None = None,
+        delay_max: float | None = None,
+        http_precheck: bool | None = None,
+    ) -> None:
+        """
+        Применяет параметры на ходу. Вызывается RuntimeSettings после
+        каждого изменения; безопасно для выполняющихся проверок.
+        """
+        if retries is not None:
+            self._max_retries = max(1, min(20, int(retries)))
+        if concurrency is not None:
+            self._sem.set_limit(int(concurrency))
+        if delay_min is not None:
+            self._delay_min = max(0.0, float(delay_min))
+        if delay_max is not None:
+            self._delay_max = max(self._delay_min, float(delay_max))
+        if http_precheck is not None:
+            self._http_enabled = bool(http_precheck)
+        logger.info(
+            "Чекер: параметры обновлены (ретраи=%d, параллельно=%d, "
+            "пауза=%.1f–%.1f с, HTTP=%s)",
+            self._max_retries, self._sem.limit,
+            self._delay_min, self._delay_max,
+            "вкл" if self._http_enabled else "выкл",
+        )
+
+    @property
+    def runtime(self) -> dict[str, object]:
+        """Текущие живые параметры — для диагностики."""
+        return {
+            "retries": self._max_retries,
+            "concurrency": self._sem.limit,
+            "delay_min": self._delay_min,
+            "delay_max": self._delay_max,
+            "http_precheck": self._http_enabled,
+        }
+
     async def _http_precheck(self, username: str) -> Literal["taken", "unknown"]:
         if self._http is None or self._http.closed:
             await self.start()

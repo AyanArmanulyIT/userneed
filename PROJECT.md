@@ -135,6 +135,9 @@ python -m config
 # Статический анализ
 python -m pyflakes .
 
+# Проверка, что все файлы одной ревизии (после ручного копирования)
+python selfcheck.py
+
 # Запуск бота
 python main.py
 
