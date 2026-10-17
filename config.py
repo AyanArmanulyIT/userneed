@@ -2,9 +2,19 @@
 Конфигурация приложения. Все параметры читаются из .env.
 
 Правила:
-  • load_dotenv() из python-dotenv — читает файл рядом.
+  • load_dotenv() из python-dotenv — читает .env рядом с этим файлом
+    (а не в текущей папке), поэтому бот можно запускать из любого cwd.
   • Типы приводятся с валидацией, ошибки — понятные.
   • Если обязательное поле пусто — бот не стартует в «полу-рабочем» виде.
+  • Опасные, но допустимые комбинации (пустой whitelist в бете, нет
+    админов) не роняют старт, а попадают в runtime_warnings() — main.py
+    пишет их в лог, `python -m config` печатает в консоль.
+
+Пути:
+  • PROJECT_ROOT — папка с config.py.
+  • cfg.data_dir  — где лежат все *.db, *.session, logs/, backups/.
+    По умолчанию = PROJECT_ROOT (как было раньше при запуске из корня).
+    Задаётся через DATA_DIR, если хочется держать данные отдельно от кода.
 """
 from __future__ import annotations
 
@@ -14,7 +24,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 # =============================================================================
@@ -54,7 +66,7 @@ def _get_str(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
-def _parse_int_set(raw: str) -> frozenset[int]:
+def _parse_int_set(raw: str, name: str) -> frozenset[int]:
     """'111, 222, 333' → frozenset({111, 222, 333})."""
     raw = raw.replace(" ", "")
     if not raw:
@@ -66,7 +78,9 @@ def _parse_int_set(raw: str) -> frozenset[int]:
         try:
             out.add(int(token))
         except ValueError as exc:
-            raise RuntimeError(f"❌ Ожидалось число, получено: {token!r}") from exc
+            raise RuntimeError(
+                f"❌ {name}: ожидалось число, получено: {token!r}"
+            ) from exc
     return frozenset(out)
 
 
@@ -85,21 +99,28 @@ def _parse_str_list(raw: str, fallback: tuple[str, ...] = ()) -> tuple[str, ...]
     return tuple(out)
 
 
+def _resolve_path(raw: str, default: Path) -> Path:
+    """Пустое значение → default. Относительный путь — от корня проекта."""
+    if not raw:
+        return default
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return p
+
+
 def _get_banner_path() -> str:
     """
     BANNER_PATH — URL или локальный путь.
     URL возвращается как есть. Локальный путь нормализуется относительно
-    корня проекта (папка, где лежит config.py).
+    корня проекта.
     """
     raw = _get_str("BANNER_PATH")
     if not raw:
         return ""
     if raw.lower().startswith(("http://", "https://")):
         return raw
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parent / p).resolve()
-    return str(p)
+    return str(_resolve_path(raw, PROJECT_ROOT))
 
 
 # =============================================================================
@@ -124,6 +145,7 @@ class Config:
 
     # Чекер
     check_concurrency: int
+    check_retries: int
     flood_cooldown_extra: int
     flood_park_threshold: int
     check_delay_min: float
@@ -135,10 +157,13 @@ class Config:
     gen_max_smart: int
     gen_max_random: int
     gen_busy_retry_hint: int
+    name_length: int
+    bulk_limit: int
 
     # Хранилище
     storage_enabled: bool
     found_history_days: int
+    data_dir: Path
 
     # Генератор
     use_external_dict: bool
@@ -152,8 +177,66 @@ class Config:
     watch_batch_size: int
     watch_sleep_after_days: int
 
+    # Бэкапы
+    backup_include_secrets: bool
+
     # Брендинг
     banner_path: str
+
+    # --- Производные пути ---------------------------------------------------
+
+    def db_path(self, name: str) -> Path:
+        """Путь к файлу БД внутри data_dir: cfg.db_path('found.db')."""
+        return self.data_dir / name
+
+    def session_path(self, session_name: str) -> str:
+        """Путь к Telethon-сессии (без расширения — Telethon добавит .session)."""
+        return str(self.data_dir / session_name)
+
+    @property
+    def log_dir(self) -> Path:
+        return self.data_dir / "logs"
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.data_dir / "backups"
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_ids
+
+    def has_access(self, user_id: int) -> bool:
+        if not self.beta_mode:
+            return True
+        return user_id in self.admin_ids or user_id in self.allowed_user_ids
+
+    # --- Предупреждения, не блокирующие старт --------------------------------
+
+    def runtime_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        if not self.admin_ids:
+            warnings.append(
+                "ADMIN_IDS пуст — админ-команды, мониторинг, обратная связь "
+                "и алерты недоступны."
+            )
+        if self.beta_mode and not self.allowed_user_ids:
+            warnings.append(
+                "BETA_MODE=1, а ALLOWED_USER_IDS пуст — бот отвечает только "
+                "администраторам. Остальные получают «доступ закрыт»."
+            )
+        if not self.beta_mode:
+            warnings.append(
+                "BETA_MODE=0 — бот открыт для всех. Убедитесь, что это осознанно."
+            )
+        if self.backup_include_secrets:
+            warnings.append(
+                "BACKUP_INCLUDE_SECRETS=1 — в архивы бэкапа попадают .env и "
+                "*.session (полный доступ к аккаунтам). Храните архивы надёжно."
+            )
+        if len(self.session_names) == 1:
+            warnings.append(
+                "Задана одна Telethon-сессия — при FloodWait пул встанет целиком."
+            )
+        return warnings
 
 
 def load_config() -> Config:
@@ -185,19 +268,30 @@ def load_config() -> Config:
     gen_max_smart = max(3, min(30, _get_int("GEN_MAX_SMART", 10)))
     gen_max_random = max(5, min(50, _get_int("GEN_MAX_RANDOM", 20)))
 
+    # Длина имён: генератор поддерживает 5–8 (имена в словаре — 5–8, слова — 5–7).
+    name_length = max(5, min(8, _get_int("NAME_LENGTH", 5)))
+    # Сколько имён принимает пакетная проверка за один сеанс.
+    bulk_limit = max(10, min(2000, _get_int("BULK_LIMIT", 200)))
+
+    data_dir = _resolve_path(_get_str("DATA_DIR"), PROJECT_ROOT)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
     return Config(
         bot_token=bot_token,
-        admin_ids=_parse_int_set(_get_str("ADMIN_IDS")),
+        admin_ids=_parse_int_set(_get_str("ADMIN_IDS"), "ADMIN_IDS"),
         usage_limit=max(1, _get_int("USAGE_LIMIT", 3)),
 
         beta_mode=_get_bool("BETA_MODE", True),
-        allowed_user_ids=_parse_int_set(_get_str("ALLOWED_USER_IDS")),
+        allowed_user_ids=_parse_int_set(
+            _get_str("ALLOWED_USER_IDS"), "ALLOWED_USER_IDS"
+        ),
 
         api_id=_get_int("API_ID"),
         api_hash=api_hash,
         session_names=session_names,
 
         check_concurrency=max(1, _get_int("CHECK_CONCURRENCY", 4)),
+        check_retries=max(1, min(12, _get_int("CHECK_RETRIES", 6))),
         flood_cooldown_extra=max(0, _get_int("FLOOD_COOLDOWN_EXTRA", 3)),
         flood_park_threshold=max(30, _get_int("FLOOD_PARK_THRESHOLD", 300)),
         check_delay_min=max(0.0, delay_min),
@@ -208,9 +302,12 @@ def load_config() -> Config:
         gen_max_smart=gen_max_smart,
         gen_max_random=gen_max_random,
         gen_busy_retry_hint=max(10, _get_int("GEN_BUSY_RETRY_HINT", 45)),
+        name_length=name_length,
+        bulk_limit=bulk_limit,
 
         storage_enabled=_get_bool("STORAGE_ENABLED", True),
         found_history_days=max(1, _get_int("FOUND_HISTORY_DAYS", 30)),
+        data_dir=data_dir,
 
         use_external_dict=_get_bool("USE_EXTERNAL_DICT", True),
         similar_max_results=max(5, _get_int("SIMILAR_MAX_RESULTS", 20)),
@@ -222,6 +319,8 @@ def load_config() -> Config:
         watch_batch_size=max(5, _get_int("WATCH_BATCH_SIZE", 30)),
         watch_sleep_after_days=max(1, _get_int("WATCH_SLEEP_AFTER_DAYS", 20)),
 
+        backup_include_secrets=_get_bool("BACKUP_INCLUDE_SECRETS", False),
+
         banner_path=_get_banner_path(),
     )
 
@@ -232,14 +331,24 @@ if __name__ == "__main__":
     print(f"  • API_ID:               {cfg.api_id}")
     print(f"  • SESSION_NAMES:        {cfg.session_names}")
     print(f"  • ADMIN_IDS:            {sorted(cfg.admin_ids) or '—'}")
+    print(f"  • BETA_MODE:            {cfg.beta_mode}  "
+          f"(приглашено: {len(cfg.allowed_user_ids)})")
     print(f"  • USAGE_LIMIT:          {cfg.usage_limit}")
+    print(f"  • DATA_DIR:             {cfg.data_dir}")
     print(f"  • STORAGE_ENABLED:      {cfg.storage_enabled}")
     print(f"  • FOUND_HISTORY_DAYS:   {cfg.found_history_days}")
     print(f"  • USE_EXTERNAL_DICT:    {cfg.use_external_dict}")
+    print(f"  • NAME_LENGTH:          {cfg.name_length}")
+    print(f"  • BULK_LIMIT:           {cfg.bulk_limit}")
+    print(f"  • CHECK_CONCURRENCY:    {cfg.check_concurrency}")
+    print(f"  • CHECK_RETRIES:        {cfg.check_retries}")
     print(f"  • SIMILAR_MAX_RESULTS:  {cfg.similar_max_results}")
     print(f"  • FILTER_MIN_SCORE:     {cfg.filter_min_score}")
     print(f"  • WATCH_INTERVALS:      "
           f"hot={cfg.watch_hot_interval}s, "
           f"warm={cfg.watch_warm_interval}s, "
           f"cold={cfg.watch_cold_interval}s")
+    print(f"  • BACKUP_INCLUDE_SECRETS: {cfg.backup_include_secrets}")
     print(f"  • BANNER_PATH:          {cfg.banner_path or '— (текстовый баннер)'}")
+    for w in cfg.runtime_warnings():
+        print(f"  ⚠ {w}")

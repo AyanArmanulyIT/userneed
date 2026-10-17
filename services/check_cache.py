@@ -1,5 +1,5 @@
 """
-CheckCache — SQLite-кэш результатов проверок username.
+CheckCache — SQLite-кэш результатов проверок username (check_cache.db).
 
 Зачем: 80% всех проверок — занятые имена. Если @vital занят сегодня,
 он будет занят и через час. Нет смысла ходить в Telegram каждый раз.
@@ -42,14 +42,15 @@ class CheckCache:
         self._last_clean = 0.0
         self._hits = 0
         self._misses = 0
+        self._db: sqlite3.Connection | None = None
         try:
             self._db = sqlite3.connect(self._path, check_same_thread=False)
             self._db.row_factory = sqlite3.Row
             self._init_schema()
             logger.info("Кэш проверок: %s", self._path)
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.exception("Не удалось открыть кэш %s: %s", self._path, exc)
-            self._db = None  # type: ignore[assignment]
+            self._db = None
 
     def _init_schema(self) -> None:
         assert self._db is not None
@@ -66,18 +67,19 @@ class CheckCache:
                     ON checked (cached_at)
             """)
 
+    @staticmethod
+    def _norm(username: str) -> str:
+        return username.lstrip("@").strip().lower()
+
     # --- Публичный API -------------------------------------------------------
 
     def get(self, username: str) -> str | None:
-        """
-        Возвращает кэшированный статус, если он свежий, иначе None.
-        Обновляет счётчики hits/misses.
-        """
+        """Кэшированный статус, если он свежий, иначе None. Ведёт hits/misses."""
         if self._db is None:
             self._misses += 1
             return None
 
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
         try:
             cur = self._db.execute(
                 "SELECT status, cached_at FROM checked WHERE username = ?",
@@ -90,13 +92,8 @@ class CheckCache:
 
             status = row["status"]
             ttl = _TTL.get(status)
-            if ttl is None:
-                # Не должны попасть сюда, но защита.
-                self._misses += 1
-                return None
-
-            if time.time() - row["cached_at"] > ttl:
-                # Устарело — удалить и промах.
+            if ttl is None or time.time() - row["cached_at"] > ttl:
+                # Неизвестный статус или устарело — удалить и промах.
                 with self._db:
                     self._db.execute(
                         "DELETE FROM checked WHERE username = ?", (username,)
@@ -106,18 +103,16 @@ class CheckCache:
 
             self._hits += 1
             return status
-        except Exception:
-            logger.exception("cache.get(%s) упал", username)
+        except sqlite3.Error as exc:
+            logger.exception("cache.get(%s) упал: %s", username, exc)
             self._misses += 1
             return None
 
     def set(self, username: str, status: str) -> None:
         """Сохраняет результат, если он устойчивый (taken / invalid / fragment)."""
-        if self._db is None:
+        if self._db is None or status not in _TTL:
             return
-        if status not in _TTL:
-            return
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
         try:
             with self._db:
                 self._db.execute(
@@ -130,10 +125,9 @@ class CheckCache:
                     """,
                     (username, status, time.time()),
                 )
-        except Exception:
-            logger.exception("cache.set(%s) упал", username)
+        except sqlite3.Error as exc:
+            logger.exception("cache.set(%s) упал: %s", username, exc)
 
-        # Периодическая очистка.
         now = time.time()
         if now - self._last_clean > _CLEAN_INTERVAL:
             self._last_clean = now
@@ -143,23 +137,23 @@ class CheckCache:
         """Удаляет запись (например, если username успешно заняли)."""
         if self._db is None:
             return
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
         try:
             with self._db:
                 self._db.execute(
                     "DELETE FROM checked WHERE username = ?", (username,)
                 )
-        except Exception:
-            pass
+        except sqlite3.Error as exc:
+            logger.exception("cache.invalidate(%s) упал: %s", username, exc)
 
     def stats(self) -> dict[str, int]:
-        if self._db is None:
-            return {"total": 0, "hits": self._hits, "misses": self._misses}
-        try:
-            cur = self._db.execute("SELECT COUNT(*) FROM checked")
-            total = int(cur.fetchone()[0])
-        except Exception:
-            total = 0
+        total = 0
+        if self._db is not None:
+            try:
+                cur = self._db.execute("SELECT COUNT(*) FROM checked")
+                total = int(cur.fetchone()[0])
+            except sqlite3.Error as exc:
+                logger.exception("cache.stats упал: %s", exc)
         return {"total": total, "hits": self._hits, "misses": self._misses}
 
     def _cleanup(self) -> None:
@@ -173,8 +167,8 @@ class CheckCache:
                 )
             if cur.rowcount:
                 logger.debug("Кэш: удалено %d старых записей", cur.rowcount)
-        except Exception:
-            logger.exception("cache._cleanup упал")
+        except sqlite3.Error as exc:
+            logger.exception("cache._cleanup упал: %s", exc)
 
     def close(self) -> None:
         if self._db is not None:

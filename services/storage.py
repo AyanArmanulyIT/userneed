@@ -1,16 +1,19 @@
 """
-SQLite-хранилище находок и истории проверок.
+SQLite-хранилище находок и истории проверок (found.db).
 
 Задачи модуля:
   • Запоминать всё, что бот нашёл свободным — с оценкой и датой.
-  • Не показывать «новинку», если имя уже находилось раньше.
+  • Помнить, какие имена пользователи отметили как занятые («✓ Занял»),
+    чтобы генератор больше их не предлагал.
   • Хранить историю для /found и экспорта.
   • Периодически чистить старые записи (retention).
   • Никаких внешних зависимостей — только стандартный sqlite3.
 
 Работает в одном потоке с основным asyncio-loop. Все методы синхронные —
-это нормально: SQLite-операции занимают микросекунды, при желании можно
-вынести в executor, но для нагрузки бота это избыточно.
+это нормально: SQLite-операции занимают микросекунды.
+
+Все публичные методы не бросают исключений наружу: если БД испортилась,
+бот продолжит работать, просто без истории (ошибки уходят в лог).
 """
 from __future__ import annotations
 
@@ -46,25 +49,21 @@ class FoundRecord:
 # =============================================================================
 
 class FoundStorage:
-    """
-    Обёртка над SQLite с таблицей находок.
-
-    Все публичные методы идемпотентны и не бросают исключений наружу —
-    если БД испортилась, бот продолжит работать, просто без истории.
-    """
+    """Обёртка над SQLite с таблицей находок."""
 
     def __init__(self, path: Path | str, retention_days: int = 30) -> None:
-        self._path = Path(path)
+        self._path = Path(path) if str(path) != ":memory:" else path
         self._retention_days = max(1, retention_days)
+        self._db: sqlite3.Connection | None = None
 
         try:
             self._db = sqlite3.connect(self._path, check_same_thread=False)
             self._db.row_factory = sqlite3.Row
             self._init_schema()
             logger.info("Хранилище находок: %s", self._path)
-        except Exception as exc:      # noqa: BLE001
+        except sqlite3.Error as exc:
             logger.exception("Не удалось открыть %s: %s", self._path, exc)
-            self._db = None  # type: ignore[assignment]
+            self._db = None
 
     # --- Схема ---------------------------------------------------------------
 
@@ -95,6 +94,10 @@ class FoundStorage:
                     ON found (found_by, found_at DESC)
             """)
 
+    @staticmethod
+    def _norm(username: str) -> str:
+        return username.lstrip("@").strip().lower()
+
     # --- Запись --------------------------------------------------------------
 
     def record(
@@ -106,25 +109,23 @@ class FoundStorage:
         found_by: int = 0,
     ) -> bool:
         """
-        Пытается записать находку. Возвращает True, если имя записано
-        ВПЕРВЫЕ — это и есть признак «новая находка», а не дежавю.
+        Записывает находку. Возвращает True, если имя записано ВПЕРВЫЕ —
+        это признак «новая находка», а не дежавю.
         """
         if self._db is None:
             return True     # без БД считаем всё новым, чтобы не ломать UX
 
-        username = username.lstrip("@").strip().lower()
+        username = self._norm(username)
         if not username:
             return False
 
         try:
             with self._db:
-                # Проверяем — может, это имя уже светилось?
                 cur = self._db.execute(
                     "SELECT 1 FROM found WHERE username = ? LIMIT 1",
                     (username,),
                 )
                 is_new = cur.fetchone() is None
-
                 self._db.execute(
                     """
                     INSERT INTO found (username, score, source, status, found_at, found_by)
@@ -133,24 +134,36 @@ class FoundStorage:
                     (username, score, source, status, time.time(), found_by),
                 )
             return is_new
-        except Exception as exc:      # noqa: BLE001
+        except sqlite3.Error as exc:
             logger.exception("record(%s) упал: %s", username, exc)
             return False
 
-    def mark_claimed(self, username: str) -> None:
-        """Отметить имя как занятое пользователем (для статистики)."""
+    def mark_claimed(self, username: str, user_id: int | None = None) -> int:
+        """
+        Отметить имя как занятое пользователем.
+
+        user_id=None — отметить все записи с этим именем (системный вызов).
+        user_id=N    — только записи, которые нашёл этот пользователь:
+                       чужие находки он пометить не может.
+        Возвращает число изменённых строк.
+        """
         if self._db is None:
-            return
-        username = username.lstrip("@").strip().lower()
+            return 0
+        username = self._norm(username)
+        if not username:
+            return 0
+        sql = "UPDATE found SET claimed = 1, claimed_at = ? WHERE username = ?"
+        params: list[object] = [time.time(), username]
+        if user_id is not None:
+            sql += " AND found_by = ?"
+            params.append(user_id)
         try:
             with self._db:
-                self._db.execute(
-                    "UPDATE found SET claimed = 1, claimed_at = ? "
-                    "WHERE username = ?",
-                    (time.time(), username),
-                )
-        except Exception:
-            logger.exception("mark_claimed(%s) упал", username)
+                cur = self._db.execute(sql, params)
+            return cur.rowcount or 0
+        except sqlite3.Error as exc:
+            logger.exception("mark_claimed(%s) упал: %s", username, exc)
+            return 0
 
     # --- Чтение --------------------------------------------------------------
 
@@ -158,15 +171,42 @@ class FoundStorage:
         """True — этот username бот уже находил раньше."""
         if self._db is None:
             return False
-        username = username.lstrip("@").strip().lower()
         try:
             cur = self._db.execute(
                 "SELECT 1 FROM found WHERE username = ? LIMIT 1",
-                (username,),
+                (self._norm(username),),
             )
             return cur.fetchone() is not None
-        except Exception:
+        except sqlite3.Error as exc:
+            logger.exception("was_seen_before() упал: %s", exc)
             return False
+
+    def is_claimed(self, username: str) -> bool:
+        """True — кто-то уже нажал «✓ Занял» для этого имени."""
+        if self._db is None:
+            return False
+        try:
+            cur = self._db.execute(
+                "SELECT 1 FROM found WHERE username = ? AND claimed = 1 LIMIT 1",
+                (self._norm(username),),
+            )
+            return cur.fetchone() is not None
+        except sqlite3.Error as exc:
+            logger.exception("is_claimed() упал: %s", exc)
+            return False
+
+    def claimed_names(self) -> set[str]:
+        """Все имена, отмеченные как занятые — для фильтра в генераторе."""
+        if self._db is None:
+            return set()
+        try:
+            cur = self._db.execute(
+                "SELECT DISTINCT username FROM found WHERE claimed = 1"
+            )
+            return {r["username"] for r in cur.fetchall()}
+        except sqlite3.Error as exc:
+            logger.exception("claimed_names() упал: %s", exc)
+            return set()
 
     def recent(
         self,
@@ -201,9 +241,26 @@ class FoundStorage:
         try:
             cur = self._db.execute(sql, params)
             return [self._row_to_record(r) for r in cur.fetchall()]
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.exception("recent() упал: %s", exc)
             return []
+
+    def count_since(self, days: int = 1) -> tuple[int, int]:
+        """(записей, уникальных пользователей) за последние N дней."""
+        if self._db is None:
+            return 0, 0
+        cutoff = time.time() - days * 86400
+        try:
+            cur = self._db.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT found_by) FROM found "
+                "WHERE found_at >= ? AND found_by != 0",
+                (cutoff,),
+            )
+            row = cur.fetchone()
+            return int(row[0]), int(row[1])
+        except sqlite3.Error as exc:
+            logger.exception("count_since() упал: %s", exc)
+            return 0, 0
 
     def export_csv(
         self,
@@ -211,13 +268,11 @@ class FoundStorage:
         user_id: int | None = None,
         days: int | None = None,
     ) -> int:
-        """
-        Экспортирует находки в CSV. Возвращает количество строк (без заголовка).
-        """
+        """Экспортирует находки в CSV. Возвращает число строк (без заголовка)."""
         if self._db is None:
             return 0
 
-        where = []
+        where: list[str] = []
         params: list[object] = []
         if user_id is not None:
             where.append("found_by = ?")
@@ -234,7 +289,7 @@ class FoundStorage:
         try:
             cur = self._db.execute(sql, params)
             rows = cur.fetchall()
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.exception("export_csv() выборка упала: %s", exc)
             return 0
 
@@ -259,7 +314,7 @@ class FoundStorage:
                         "yes" if r["claimed"] else "no",
                     ])
             return len(rows)
-        except Exception as exc:
+        except OSError as exc:
             logger.exception("export_csv(%s) запись упала: %s", path, exc)
             return 0
 
@@ -267,7 +322,8 @@ class FoundStorage:
 
     def cleanup(self) -> int:
         """
-        Удаляет записи старше retention_days.
+        Удаляет записи старше retention_days. Записи с пометкой «занято»
+        не трогаем — они нужны, чтобы имя не предлагалось снова.
         Возвращает число удалённых строк.
         """
         if self._db is None:
@@ -276,7 +332,8 @@ class FoundStorage:
         try:
             with self._db:
                 cur = self._db.execute(
-                    "DELETE FROM found WHERE found_at < ?", (cutoff,)
+                    "DELETE FROM found WHERE found_at < ? AND claimed = 0",
+                    (cutoff,),
                 )
             removed = cur.rowcount or 0
             if removed:
@@ -285,35 +342,38 @@ class FoundStorage:
                     removed, self._retention_days,
                 )
             return removed
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.exception("cleanup() упал: %s", exc)
             return 0
 
     def stats(self) -> dict[str, int]:
         """Сводные счётчики для /stats."""
+        empty = {"total": 0, "free": 0, "claimed": 0}
         if self._db is None:
-            return {"total": 0, "free": 0, "claimed": 0}
+            return empty
         try:
-            cur = self._db.execute("SELECT COUNT(*) FROM found")
-            total = int(cur.fetchone()[0])
             cur = self._db.execute(
-                "SELECT COUNT(*) FROM found WHERE status = 'free'"
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status = 'free' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN claimed = 1 THEN 1 ELSE 0 END) "
+                "FROM found"
             )
-            free = int(cur.fetchone()[0])
-            cur = self._db.execute(
-                "SELECT COUNT(*) FROM found WHERE claimed = 1"
-            )
-            claimed = int(cur.fetchone()[0])
-            return {"total": total, "free": free, "claimed": claimed}
-        except Exception:
-            return {"total": 0, "free": 0, "claimed": 0}
+            row = cur.fetchone()
+            return {
+                "total": int(row[0] or 0),
+                "free": int(row[1] or 0),
+                "claimed": int(row[2] or 0),
+            }
+        except sqlite3.Error as exc:
+            logger.exception("stats() упал: %s", exc)
+            return empty
 
     def close(self) -> None:
         if self._db is not None:
             try:
                 self._db.close()
-            except Exception:
-                pass
+            except sqlite3.Error as exc:
+                logger.debug("close(): %s", exc)
             self._db = None
 
     # --- Внутренние ----------------------------------------------------------

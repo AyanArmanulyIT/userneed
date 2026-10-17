@@ -3,19 +3,30 @@
 
 Фишки:
   • Round-Robin между несколькими Telegram-аккаунтами.
-  • HTTP pre-check через https://t.me/<name> — быстрый отсев.
-  • CheckCache — SQLite-кэш занятых имён (экономит ~30% запросов).
-  • Пауза 0.8-1.5 сек ПЕР-СЕССИЯ (а не глобально).
-  • Любой FloodWait паркует только ту сессию.
-  • Если все сессии в паузе — AllSessionsFloodedError наверх.
+  • HTTP pre-check через https://t.me/<name> — быстрый отсев занятых.
+  • CheckCache — SQLite-кэш устойчивых статусов (экономит ~30% запросов).
+  • Пауза delay_min..delay_max сек ПЕР-СЕССИЯ (а не глобально).
+  • FloodWait паркует только ту сессию, на которой он пришёл.
+  • Разлогиненная/забаненная сессия паркуется надолго — пул работает
+    на остальных, SessionGuard пытается её поднять.
+  • Если все сессии в паузе — наверх летит AllSessionsFloodedError.
+
+Статусы (CheckResult):
+  free      — можно занять прямо сейчас;
+  fragment  — имя существует только на Fragment (за TON), бесплатно не занять;
+  taken     — занято;
+  invalid   — не проходит формат Telegram;
+  error     — проверить не удалось (сеть/неизвестная ошибка).
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -23,8 +34,12 @@ import aiohttp
 from telethon import TelegramClient, functions
 from telethon.errors import (
     FloodWaitError,
+    RPCError,
+    UnauthorizedError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
+    UsernameOccupiedError,
+    UsernamePurchaseAvailableError,
 )
 
 from services.check_cache import CheckCache
@@ -32,6 +47,9 @@ from services.check_cache import CheckCache
 logger = logging.getLogger(__name__)
 
 CheckResult = Literal["free", "fragment", "taken", "invalid", "error"]
+
+# Статусы, которые имеет смысл класть в кэш (free и error — нет).
+_CACHEABLE: frozenset[str] = frozenset({"taken", "invalid", "fragment"})
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
 
@@ -49,8 +67,14 @@ _HTTP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# На сколько парковать сессию при разных сбоях (секунды).
+DEAD_SESSION_PARK = 3600      # разлогин/бан — пусть SessionGuard разбирается
+NETWORK_ERROR_PARK = 30       # сетевой сбой — короткая пауза, идём на другую
+
 
 class AllSessionsFloodedError(RuntimeError):
+    """Все сессии пула на паузе — проверять некем."""
+
     def __init__(self, seconds_until_next: int) -> None:
         super().__init__(
             "Все чекер-аккаунты отдыхают от флуда. "
@@ -59,7 +83,73 @@ class AllSessionsFloodedError(RuntimeError):
         self.seconds_until_next = seconds_until_next
 
 
+class _DynamicSemaphore:
+    """
+    Семафор с изменяемым лимитом — для панели /params.
+
+    asyncio.Semaphore нельзя безопасно «расширить»: замена объекта
+    ломает release() у уже выполняющихся проверок. Здесь лимит меняется
+    на месте, а освободившиеся слоты сразу достаются ожидающим.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self) -> None:
+        if self._active < self._limit:
+            self._active += 1
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                # Слот уже передали нам, но задача отменилась — отдаём дальше.
+                self.release()
+            else:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(fut)
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if fut.done():
+                continue
+            fut.set_result(None)
+            return
+        self._active = max(0, self._active - 1)
+
+    def set_limit(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        while self._active < self._limit and self._waiters:
+            fut = self._waiters.popleft()
+            if fut.done():
+                continue
+            self._active += 1
+            fut.set_result(None)
+
+    async def __aenter__(self) -> _DynamicSemaphore:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.release()
+
+
 def is_valid_username_format(username: str) -> bool:
+    """Формат Telegram: 5-32 символа, латиница/цифры/_, без «__»."""
     if not 5 <= len(username) <= 32:
         return False
     if "__" in username:
@@ -71,14 +161,10 @@ def _verdict_from_html(html: str, username: str) -> Literal["taken", "unknown"]:
     """
     Разбор HTML t.me/<name>.
 
-    Логика:
-      • «Telegram: Contact @<username>» — это шаблон-заглушка для
-        незанятых имён. Возвращаем "unknown" — точный ответ даст MTProto.
+      • «Telegram: Contact @<username>» — шаблон-заглушка для незанятых
+        имён. Возвращаем "unknown" — точный ответ даст MTProto.
       • Любой другой title = страница реального user/channel/group.
         Возвращаем "taken" — экономим MTProto-запрос.
-
-    Улучшение против прежней версии: раньше мы пропускали каналы без
-    @username в title и шли в MTProto. Теперь ловим их на HTTP-этапе.
     """
     m = _OG_TITLE_RE.search(html)
     if not m:
@@ -86,7 +172,6 @@ def _verdict_from_html(html: str, username: str) -> Literal["taken", "unknown"]:
     title = (m.group(1) or "").strip()
     if not title:
         return "unknown"
-
     if "telegram: contact @" in title.lower():
         return "unknown"
     return "taken"
@@ -115,6 +200,7 @@ class TelegramChecker:
         session_names: list[str],
         *,
         concurrency: int = 4,
+        retries: int = MAX_RETRIES,
         flood_extra: int = 3,
         park_threshold: int = 300,
         delay_min: float = 0.8,
@@ -132,7 +218,8 @@ class TelegramChecker:
             for n, c in zip(session_names, clients)
         ]
         self._index = 0
-        self._sem = asyncio.Semaphore(max(1, concurrency))
+        self._sem = _DynamicSemaphore(concurrency)
+        self._max_retries = max(1, int(retries))
 
         self._flood_extra = max(0, flood_extra)
         self._park_threshold = max(30, park_threshold)
@@ -150,7 +237,7 @@ class TelegramChecker:
             "floods": 0,
         }
 
-    # ----- HTTP pre-check ----------------------------------------------------
+    # ----- Lifecycle / HTTP pre-check ---------------------------------------
 
     async def start(self) -> None:
         if self._http is None or self._http.closed:
@@ -162,6 +249,50 @@ class TelegramChecker:
         if self._http is not None and not self._http.closed:
             await self._http.close()
         self._http = None
+
+    # ----- Живые настройки (панель /params) ---------------------------------
+
+    def apply_runtime(
+        self,
+        *,
+        retries: int | None = None,
+        concurrency: int | None = None,
+        delay_min: float | None = None,
+        delay_max: float | None = None,
+        http_precheck: bool | None = None,
+    ) -> None:
+        """
+        Применяет параметры на ходу. Вызывается RuntimeSettings после
+        каждого изменения; безопасно для выполняющихся проверок.
+        """
+        if retries is not None:
+            self._max_retries = max(1, min(20, int(retries)))
+        if concurrency is not None:
+            self._sem.set_limit(int(concurrency))
+        if delay_min is not None:
+            self._delay_min = max(0.0, float(delay_min))
+        if delay_max is not None:
+            self._delay_max = max(self._delay_min, float(delay_max))
+        if http_precheck is not None:
+            self._http_enabled = bool(http_precheck)
+        logger.info(
+            "Чекер: параметры обновлены (ретраи=%d, параллельно=%d, "
+            "пауза=%.1f–%.1f с, HTTP=%s)",
+            self._max_retries, self._sem.limit,
+            self._delay_min, self._delay_max,
+            "вкл" if self._http_enabled else "выкл",
+        )
+
+    @property
+    def runtime(self) -> dict[str, object]:
+        """Текущие живые параметры — для диагностики."""
+        return {
+            "retries": self._max_retries,
+            "concurrency": self._sem.limit,
+            "delay_min": self._delay_min,
+            "delay_max": self._delay_max,
+            "http_precheck": self._http_enabled,
+        }
 
     async def _http_precheck(self, username: str) -> Literal["taken", "unknown"]:
         if self._http is None or self._http.closed:
@@ -183,7 +314,7 @@ class TelegramChecker:
 
     # ----- Round-Robin --------------------------------------------------------
 
-    async def _next_session(self) -> _SessionState:
+    def _next_session(self) -> _SessionState:
         now = time.monotonic()
         n = len(self._sessions)
         for _ in range(n):
@@ -191,20 +322,30 @@ class TelegramChecker:
             self._index = (self._index + 1) % n
             if s.paused_until <= now:
                 return s
-        raise AllSessionsFloodedError(self._seconds_until_unpark())
+        raise AllSessionsFloodedError(self.seconds_until_unpark())
 
-    def _park(self, session: _SessionState, seconds: int) -> None:
+    def _park(self, session: _SessionState, seconds: int, *, flood: bool) -> None:
+        """Отправляет сессию на паузу. flood=True — считаем как FloodWait."""
         session.paused_until = max(session.paused_until, time.monotonic() + seconds)
-        session.times_flooded += 1
-        session.last_flood_seconds = seconds
-        self._stats["floods"] += 1
+        if flood:
+            session.times_flooded += 1
+            session.last_flood_seconds = seconds
+            self._stats["floods"] += 1
 
-    def _seconds_until_unpark(self) -> int:
+    def seconds_until_unpark(self) -> int:
+        """Через сколько секунд освободится ближайшая запаркованная сессия."""
         now = time.monotonic()
         return max(0, int(min(s.paused_until for s in self._sessions) - now))
 
+    # Старое имя — для совместимости с кодом, который его ещё зовёт.
+    _seconds_until_unpark = seconds_until_unpark
+
+    def has_available_session(self) -> bool:
+        now = time.monotonic()
+        return any(s.paused_until <= now for s in self._sessions)
+
     async def _human_delay(self, session: _SessionState) -> None:
-        """Пауза 0.8-1.5 сек между вызовами ЭТОЙ сессии."""
+        """Пауза delay_min..delay_max сек между вызовами ЭТОЙ сессии."""
         async with session.delay_lock:
             target = random.uniform(self._delay_min, self._delay_max)
             elapsed = time.monotonic() - session.last_call_at
@@ -212,10 +353,19 @@ class TelegramChecker:
                 await asyncio.sleep(target - elapsed)
             session.last_call_at = time.monotonic()
 
+    def _remember(self, username: str, result: CheckResult) -> None:
+        if self._cache is not None and result in _CACHEABLE:
+            self._cache.set(username, result)
+
     # ----- Основной метод ----------------------------------------------------
 
     async def check(self, username: str) -> CheckResult:
-        """Проверяет один username. Может бросить AllSessionsFloodedError."""
+        """
+        Проверяет один username.
+
+        Бросает AllSessionsFloodedError, если все сессии на паузе.
+        Любые другие сбои превращаются в статус "error" (с логом).
+        """
         username = username.lstrip("@").strip().lower()
 
         if not is_valid_username_format(username):
@@ -225,7 +375,7 @@ class TelegramChecker:
         # --- Кэш: если видели этот username недавно — не тратим запросы ---
         if self._cache is not None:
             cached = self._cache.get(username)
-            if cached in ("taken", "invalid", "fragment"):
+            if cached in _CACHEABLE:
                 self._stats["cache_hits"] += 1
                 self._stats[cached] += 1
                 logger.debug("@%s → %s (кэш)", username, cached)
@@ -237,35 +387,49 @@ class TelegramChecker:
                 if await self._http_precheck(username) == "taken":
                     self._stats["taken"] += 1
                     self._stats["http_short_circuit"] += 1
-                    if self._cache is not None:
-                        self._cache.set(username, "taken")
+                    self._remember(username, "taken")
                     logger.debug("@%s → taken (HTTP)", username)
                     return "taken"
 
-            # --- MTProto с ретраями ---
-            for _ in range(self.MAX_RETRIES):
-                session = await self._next_session()
+            # --- MTProto с ретраями по сессиям ---
+            for _ in range(self._max_retries):
+                session = self._next_session()
                 await self._human_delay(session)
 
                 try:
                     result = await self._check_mtproto(session, username)
-                    # Успешные устойчивые статусы сохраняем в кэш.
-                    if self._cache is not None and result in (
-                        "taken", "invalid", "fragment"
-                    ):
-                        self._cache.set(username, result)
-                    return result
-
                 except FloodWaitError as exc:
                     wait = int(exc.seconds) + self._flood_extra
-                    self._park(session, wait)
+                    self._park(session, wait, flood=True)
                     logger.warning(
                         "🚦 FloodWait %ss на сессии %s (@%s). Паркуем, идём на другую.",
                         wait, session.name, username,
                     )
                     continue
+                except UnauthorizedError as exc:
+                    # Сессия разлогинена/забанена. Уводим её из ротации надолго.
+                    self._park(session, DEAD_SESSION_PARK, flood=False)
+                    logger.error(
+                        "Сессия %s не авторизована (%s). Паркуем на %d с.",
+                        session.name, type(exc).__name__, DEAD_SESSION_PARK,
+                    )
+                    continue
+                except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                    self._park(session, NETWORK_ERROR_PARK, flood=False)
+                    logger.warning(
+                        "Сетевой сбой на сессии %s (@%s): %s. Пауза %d с.",
+                        session.name, username, exc, NETWORK_ERROR_PARK,
+                    )
+                    continue
                 except asyncio.CancelledError:
                     raise
+                except RPCError as exc:
+                    logger.warning(
+                        "Проверка @%s (сессия %s): RPC-ошибка %s",
+                        username, session.name, type(exc).__name__,
+                    )
+                    self._stats["error"] += 1
+                    return "error"
                 except Exception as exc:
                     logger.exception(
                         "Проверка @%s (сессия %s) упала: %s",
@@ -274,12 +438,23 @@ class TelegramChecker:
                     self._stats["error"] += 1
                     return "error"
 
+                self._remember(username, result)
+                return result
+
+            logger.warning("@%s: исчерпаны попытки (%d)", username, self._max_retries)
             self._stats["error"] += 1
             return "error"
 
     async def _check_mtproto(
         self, session: _SessionState, username: str
     ) -> CheckResult:
+        """
+        Два шага:
+          1. ResolveUsername — если нашёлся объект, имя занято.
+          2. CheckUsername — Telegram отвечает, можно ли занять ИМЕННО сейчас:
+             True → free, False → недоступно (зарезервировано) → taken,
+             UsernamePurchaseAvailableError → fragment.
+        """
         try:
             await session.client(
                 functions.contacts.ResolveUsernameRequest(username)
@@ -288,36 +463,43 @@ class TelegramChecker:
             self._stats["taken"] += 1
             logger.debug("@%s → taken (сессия %s)", username, session.name)
             return "taken"
-
         except UsernameNotOccupiedError:
             session.calls_made += 1
-
         except UsernameInvalidError:
+            session.calls_made += 1
             self._stats["invalid"] += 1
             return "invalid"
 
         # --- Точная проверка: можно ли занять прямо сейчас ---
         try:
-            await session.client(
+            available = await session.client(
                 functions.account.CheckUsernameRequest(username=username)
             )
+            session.calls_made += 1
+        except UsernamePurchaseAvailableError:
+            session.calls_made += 1
+            self._stats["fragment"] += 1
+            logger.debug("@%s → fragment (только за TON)", username)
+            return "fragment"
+        except UsernameOccupiedError:
+            session.calls_made += 1
+            self._stats["taken"] += 1
+            logger.debug("@%s → occupied (гонка)", username)
+            return "taken"
+        except UsernameInvalidError:
+            session.calls_made += 1
+            self._stats["invalid"] += 1
+            return "invalid"
+
+        if available:
             self._stats["free"] += 1
             logger.debug("@%s → FREE (сессия %s)", username, session.name)
             return "free"
 
-        except UsernamePurchaseAvailableError:
-            self._stats["fragment"] += 1
-            logger.debug("@%s → fragment (только за TON)", username)
-            return "fragment"
-
-        except UsernameOccupiedError:
-            self._stats["taken"] += 1
-            logger.debug("@%s → occupied (гонка)", username)
-            return "taken"
-
-        except UsernameInvalidError:
-            self._stats["invalid"] += 1
-            return "invalid"
+        # False без исключения — имя недоступно (зарезервировано Telegram).
+        self._stats["taken"] += 1
+        logger.debug("@%s → недоступно (CheckUsername=False)", username)
+        return "taken"
 
     # ----- Публичные утилиты -------------------------------------------------
 

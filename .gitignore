@@ -1,10 +1,14 @@
-﻿# Python
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Секреты и данные проекта — НИКОГДА в репозиторий
 .env
@@ -12,6 +16,9 @@ __pycache__/
 *.session-journal
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+data/
 
 # Локальные артефакты
 logs/
