@@ -8,6 +8,7 @@
   04 — История находок (SQLite)
   05 — Регламент
   06 — Связь с админом (обратная связь)
+  07 — Параметры прогонов (только операторы, settings.db)
 
 Ключевые механики:
   • Закрытая бета: AccessMiddleware (outer) пропускает только whitelist.
@@ -18,6 +19,8 @@
     завершения прогона. Отказ в очереди, флуд всех сессий, таймаут и
     внутренняя ошибка сеанс не списывают.
   • Кнопка «Прервать/Завершить» — per-run asyncio.Event, не глобальный флаг.
+  • Параметры прогонов (/params) хранятся в SQLite, читаются на каждом
+    прогоне; чекер получает новые значения на ходу через apply_runtime().
   • Все тексты — в bot/branding.py. Здесь строк для пользователя нет.
 """
 from __future__ import annotations
@@ -62,6 +65,11 @@ from bot.keyboards import (
     gen_progress_kb,
     gen_similar_count_menu,
     main_menu,
+    settings_back_kb,
+    settings_confirm_kb,
+    settings_group_kb,
+    settings_panel_kb,
+    settings_param_kb,
     watch_menu,
 )
 from bot.utils import chunk_lines, progress_bar
@@ -83,6 +91,7 @@ from services.generator import (
     score_username,
 )
 from services.quota import QuotaStorage
+from services.runtime_settings import ParamSpec, RuntimeSettings, SettingsError
 from services.session_guard import SessionGuard
 from services.storage import FoundStorage
 from services.watchlist import Watchlist
@@ -95,7 +104,6 @@ router = Router(name="userneed")
 #                              Константы
 # =============================================================================
 
-BULK_LIMIT = 200
 GEN_BATCH = 10                 # минимальный размер пакета генерации
 GEN_MAX_FACTOR = 25            # потолок проверок = target × фактор
 MAX_EMPTY_BATCHES = 3          # подряд пустых пакетов → генератор исчерпан
@@ -132,6 +140,10 @@ class SimilarStates(StatesGroup):
 
 class FeedbackStates(StatesGroup):
     waiting_text = State()
+
+
+class SettingsStates(StatesGroup):
+    waiting_value = State()
 
 
 # =============================================================================
@@ -537,9 +549,14 @@ async def cmd_start(
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, cfg: Config) -> None:
+async def cmd_help(
+    message: Message, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    is_admin = message.from_user is not None and cfg.is_admin(message.from_user.id)
     await message.answer(
-        B.help_text(cfg.usage_limit, BULK_LIMIT, GEN_HARD_TIMEOUT // 60),
+        B.help_text(
+            cfg.usage_limit, settings.bulk_limit, GEN_HARD_TIMEOUT // 60, is_admin,
+        ),
         reply_markup=back_to_main(),
     )
 
@@ -732,6 +749,350 @@ async def cmd_quota_add(
 
 
 # =============================================================================
+#                Модуль 07 · Параметры (только операторы)
+# =============================================================================
+
+def _actor(user: Any) -> str:
+    """Человекочитаемое имя автора изменения для журнала."""
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    full_name = getattr(user, "full_name", "") or ""
+    return (full_name or str(getattr(user, "id", "—")))[:64]
+
+
+async def _settings_guard(call: CallbackQuery, cfg: Config) -> bool:
+    if cfg.is_admin(call.from_user.id):
+        return True
+    await call.answer(B.ADMIN_ONLY_ALERT, show_alert=True)
+    return False
+
+
+def _settings_markup(settings: RuntimeSettings, spec: ParamSpec) -> InlineKeyboardMarkup:
+    return settings_param_kb(
+        spec.key,
+        spec.group,
+        is_bool=spec.kind == "bool",
+        step_text=B.settings_step_text(spec),
+        has_override=settings.has_override(spec.key),
+    )
+
+
+async def _settings_show_param(
+    target: Message,
+    settings: RuntimeSettings,
+    spec: ParamSpec,
+    *,
+    saved: bool = False,
+) -> None:
+    await _edit_or_caption(
+        target,
+        B.settings_param(settings, spec, saved=saved),
+        reply_markup=_settings_markup(settings, spec),
+    )
+
+
+def _settings_spec(settings: RuntimeSettings, data: str | None) -> ParamSpec | None:
+    """settings:edit:<key> → ParamSpec, иначе None."""
+    parts = (data or "").split(":", 2)
+    if len(parts) != 3:
+        return None
+    try:
+        return settings.spec(parts[2])
+    except SettingsError:
+        return None
+
+
+@router.message(Command("params"))
+async def cmd_params(
+    message: Message, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _admin_only(message, cfg):
+        return
+    await message.answer(
+        B.settings_panel(settings),
+        reply_markup=settings_panel_kb(settings.override_count()),
+    )
+
+
+@router.callback_query(F.data == "settings:open")
+async def cb_settings_open(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    await _edit_or_caption(
+        msg,
+        B.settings_panel(settings),
+        reply_markup=settings_panel_kb(settings.override_count()),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("settings:group:"))
+async def cb_settings_group(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    parts = (call.data or "").split(":", 2)
+    group = parts[2] if len(parts) == 3 else ""
+    if group not in settings.grouped():
+        await call.answer(B.SETTINGS_BAD_GROUP, show_alert=True)
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    items: list[tuple[str, str]] = []
+    for spec in settings.grouped()[group]:
+        value = B.settings_value(spec, settings.get(spec.key))
+        items.append((spec.key, f"{B.SETTINGS_LABELS[spec.key]} · {value}"))
+    await _edit_or_caption(
+        msg,
+        B.settings_group(settings, group),
+        reply_markup=settings_group_kb(group, items),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("settings:edit:"))
+async def cb_settings_edit(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    spec = _settings_spec(settings, call.data)
+    if spec is None:
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    await _settings_show_param(msg, settings, spec)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("settings:inc:"))
+@router.callback_query(F.data.startswith("settings:dec:"))
+async def cb_settings_step(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    """Кнопки «− шаг» и «+ шаг»."""
+    if not await _settings_guard(call, cfg):
+        return
+    spec = _settings_spec(settings, call.data)
+    if spec is None:
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    if spec.kind == "bool":
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    direction = 1 if (call.data or "").startswith("settings:inc:") else -1
+    current = settings.get(spec.key)
+    new_value = float(current) + direction * spec.step
+    try:
+        settings.set(
+            spec.key, new_value, call.from_user.id, _actor(call.from_user),
+        )
+    except SettingsError as exc:
+        await call.answer(
+            B.settings_error_text(exc.code, spec, exc.minimum, exc.maximum),
+            show_alert=True,
+        )
+        return
+    msg = _cb_message(call)
+    await call.answer(B.settings_saved_alert(spec, settings.get(spec.key)))
+    if msg is not None:
+        await _settings_show_param(msg, settings, spec, saved=True)
+
+
+@router.callback_query(F.data.startswith("settings:toggle:"))
+async def cb_settings_toggle(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    spec = _settings_spec(settings, call.data)
+    if spec is None or spec.kind != "bool":
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    try:
+        settings.set(
+            spec.key,
+            not bool(settings.get(spec.key)),
+            call.from_user.id,
+            _actor(call.from_user),
+        )
+    except SettingsError as exc:
+        await call.answer(
+            B.settings_error_text(exc.code, spec, exc.minimum, exc.maximum),
+            show_alert=True,
+        )
+        return
+    msg = _cb_message(call)
+    await call.answer(B.settings_saved_alert(spec, settings.get(spec.key)))
+    if msg is not None:
+        await _settings_show_param(msg, settings, spec, saved=True)
+
+
+@router.callback_query(F.data.startswith("settings:ask:"))
+async def cb_settings_ask(
+    call: CallbackQuery,
+    cfg: Config,
+    settings: RuntimeSettings,
+    state: FSMContext,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    spec = _settings_spec(settings, call.data)
+    if spec is None:
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    await state.set_state(SettingsStates.waiting_value)
+    await state.update_data(settings_key=spec.key)
+    await _edit_or_caption(
+        msg,
+        B.settings_prompt(settings, spec),
+        reply_markup=settings_back_kb(spec.group),
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.waiting_value, F.text)
+async def handle_settings_value(
+    message: Message,
+    state: FSMContext,
+    cfg: Config,
+    settings: RuntimeSettings,
+) -> None:
+    user = message.from_user
+    if user is None or not cfg.is_admin(user.id):
+        await state.clear()
+        await message.answer(B.ADMIN_ONLY)
+        return
+
+    data = await state.get_data()
+    key = str(data.get("settings_key") or "")
+    try:
+        spec = settings.spec(key)
+    except SettingsError:
+        await state.clear()
+        await message.answer(B.SETTINGS_BAD_PARAM)
+        return
+
+    try:
+        settings.set(key, message.text or "", user.id, _actor(user))
+    except SettingsError as exc:
+        await message.answer(
+            B.settings_error_text(exc.code, spec, exc.minimum, exc.maximum),
+            reply_markup=settings_back_kb(spec.group),
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        B.settings_param(settings, spec, saved=True),
+        reply_markup=_settings_markup(settings, spec),
+    )
+
+
+@router.message(SettingsStates.waiting_value)
+async def settings_wrong_input(message: Message) -> None:
+    await message.answer(B.SETTINGS_TEXT_EXPECTED)
+
+
+@router.callback_query(F.data.startswith("settings:reset:"))
+async def cb_settings_reset(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    spec = _settings_spec(settings, call.data)
+    if spec is None:
+        await call.answer(B.SETTINGS_BAD_PARAM, show_alert=True)
+        return
+    changed = settings.reset(
+        spec.key, call.from_user.id, _actor(call.from_user),
+    )
+    if not changed:
+        await call.answer(B.SETTINGS_NOT_OVERRIDDEN, show_alert=True)
+        return
+    msg = _cb_message(call)
+    await call.answer(B.settings_reset_alert(spec))
+    if msg is not None:
+        await _settings_show_param(msg, settings, spec)
+
+
+@router.callback_query(F.data == "settings:reset_all")
+async def cb_settings_reset_all(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    count = settings.override_count()
+    if count == 0:
+        await call.answer(B.SETTINGS_NOT_OVERRIDDEN, show_alert=True)
+        return
+    await _edit_or_caption(
+        msg,
+        B.settings_confirm_reset_all(count),
+        reply_markup=settings_confirm_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "settings:reset_all_yes")
+async def cb_settings_reset_all_yes(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    count = settings.reset_all(
+        call.from_user.id, _actor(call.from_user),
+    )
+    msg = _cb_message(call)
+    await call.answer(B.settings_reset_all_done(count))
+    if msg is not None:
+        await _edit_or_caption(
+            msg,
+            B.settings_panel(settings),
+            reply_markup=settings_panel_kb(settings.override_count()),
+        )
+
+
+@router.callback_query(F.data == "settings:log")
+async def cb_settings_log(
+    call: CallbackQuery, cfg: Config, settings: RuntimeSettings,
+) -> None:
+    if not await _settings_guard(call, cfg):
+        return
+    msg = _cb_message(call)
+    if msg is None:
+        await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
+        return
+    await _edit_or_caption(
+        msg,
+        B.settings_log(settings, settings.history(10)),
+        reply_markup=settings_panel_kb(settings.override_count()),
+    )
+    await call.answer()
+
+
+# =============================================================================
 #                        Навигация
 # =============================================================================
 
@@ -757,13 +1118,17 @@ async def cb_main_menu(
 
 
 @router.callback_query(F.data == "help")
-async def cb_help(call: CallbackQuery, cfg: Config) -> None:
+async def cb_help(call: CallbackQuery, cfg: Config, settings: RuntimeSettings) -> None:
     msg = _cb_message(call)
     if msg is None:
         await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
         return
     await _edit_or_caption(
-        msg, B.help_text(cfg.usage_limit, BULK_LIMIT, GEN_HARD_TIMEOUT // 60),
+        msg,
+        B.help_text(
+            cfg.usage_limit, settings.bulk_limit, GEN_HARD_TIMEOUT // 60,
+            cfg.is_admin(call.from_user.id),
+        ),
         reply_markup=back_to_main(),
     )
     await call.answer()
@@ -943,20 +1308,24 @@ async def cb_gen_start(
 
 
 @router.callback_query(F.data == "gen:mode:smart")
-async def cb_gen_smart(call: CallbackQuery, cfg: Config, quota: QuotaStorage) -> None:
+async def cb_gen_smart(
+    call: CallbackQuery, cfg: Config, quota: QuotaStorage, settings: RuntimeSettings,
+) -> None:
     await _gen_screen(
         call, cfg, quota,
         lambda rem: B.gen_count_intro("smart", rem, _limit_for(call.from_user.id, cfg, quota)),
-        gen_count_menu("smart", cfg.gen_max_smart),
+        gen_count_menu("smart", settings.gen_max_smart),
     )
 
 
 @router.callback_query(F.data == "gen:mode:random")
-async def cb_gen_random(call: CallbackQuery, cfg: Config, quota: QuotaStorage) -> None:
+async def cb_gen_random(
+    call: CallbackQuery, cfg: Config, quota: QuotaStorage, settings: RuntimeSettings,
+) -> None:
     await _gen_screen(
         call, cfg, quota,
         lambda rem: B.gen_count_intro("random", rem, _limit_for(call.from_user.id, cfg, quota)),
-        gen_count_menu("random", cfg.gen_max_random),
+        gen_count_menu("random", settings.gen_max_random),
     )
 
 
@@ -980,7 +1349,11 @@ async def cb_gen_similar_start(
 
 @router.message(SimilarStates.waiting_base, F.text)
 async def handle_similar_base(
-    message: Message, state: FSMContext, cfg: Config, quota: QuotaStorage,
+    message: Message,
+    state: FSMContext,
+    cfg: Config,
+    quota: QuotaStorage,
+    settings: RuntimeSettings,
 ) -> None:
     base = (message.text or "").lstrip("@").strip().lower()
     if not _is_similar_base(base):
@@ -988,7 +1361,9 @@ async def handle_similar_base(
                              reply_markup=cancel_menu())
         return
 
-    candidates = generate_similar(base, count=cfg.similar_max_results)
+    candidates = generate_similar(
+        base, count=cfg.similar_max_results, length=settings.name_length,
+    )
     if not candidates:
         await message.answer(B.similar_no_candidates(base), reply_markup=cancel_menu())
         return
@@ -1001,7 +1376,7 @@ async def handle_similar_base(
             base, len(candidates),
             _remaining(user_id, cfg, quota), _limit_for(user_id, cfg, quota),
         ),
-        reply_markup=gen_similar_count_menu(base, cfg.gen_max_smart),
+        reply_markup=gen_similar_count_menu(base, settings.gen_max_smart),
     )
 
 
@@ -1028,7 +1403,7 @@ async def cb_gen_stop(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("gen:run:"))
 async def cb_gen_run(
     call: CallbackQuery, checker: TelegramChecker, storage: FoundStorage,
-    cfg: Config, quota: QuotaStorage,
+    cfg: Config, quota: QuotaStorage, settings: RuntimeSettings,
 ) -> None:
     parts = (call.data or "").split(":")
     if len(parts) != 4:
@@ -1043,7 +1418,7 @@ async def cb_gen_run(
     if mode not in {"smart", "random"}:
         await call.answer(B.CB_BAD_MODE, show_alert=True)
         return
-    max_allowed = cfg.gen_max_smart if mode == "smart" else cfg.gen_max_random
+    max_allowed = settings.gen_max_smart if mode == "smart" else settings.gen_max_random
     if not 1 <= target <= max_allowed:
         await call.answer(B.count_out_of_range(max_allowed), show_alert=True)
         return
@@ -1054,14 +1429,14 @@ async def cb_gen_run(
     await call.answer()
     await _run_generation(
         status=msg, user_id=call.from_user.id, mode=mode, target=target, base=None,
-        checker=checker, storage=storage, cfg=cfg, quota=quota,
+        checker=checker, storage=storage, cfg=cfg, quota=quota, settings=settings,
     )
 
 
 @router.callback_query(F.data.startswith("gen:sim:"))
 async def cb_gen_similar_run(
     call: CallbackQuery, checker: TelegramChecker, storage: FoundStorage,
-    cfg: Config, quota: QuotaStorage,
+    cfg: Config, quota: QuotaStorage, settings: RuntimeSettings,
 ) -> None:
     parts = (call.data or "").split(":")
     if len(parts) != 4:
@@ -1076,8 +1451,8 @@ async def cb_gen_similar_run(
     if not _is_similar_base(base):
         await call.answer(B.CB_BAD_BASE, show_alert=True)
         return
-    if not 1 <= target <= cfg.gen_max_smart:
-        await call.answer(B.count_out_of_range(cfg.gen_max_smart), show_alert=True)
+    if not 1 <= target <= settings.gen_max_smart:
+        await call.answer(B.count_out_of_range(settings.gen_max_smart), show_alert=True)
         return
     msg = _cb_message(call)
     if msg is None:
@@ -1086,7 +1461,7 @@ async def cb_gen_similar_run(
     await call.answer()
     await _run_generation(
         status=msg, user_id=call.from_user.id, mode="similar", target=target, base=base,
-        checker=checker, storage=storage, cfg=cfg, quota=quota,
+        checker=checker, storage=storage, cfg=cfg, quota=quota, settings=settings,
     )
 
 
@@ -1123,7 +1498,7 @@ async def cb_ack_claim(
 @router.callback_query(F.data.startswith("sim_base:"))
 async def cb_similar_from(
     call: CallbackQuery, checker: TelegramChecker, storage: FoundStorage,
-    cfg: Config, quota: QuotaStorage,
+    cfg: Config, quota: QuotaStorage, settings: RuntimeSettings,
 ) -> None:
     base = (call.data or "").split(":", 1)[1].strip().lower()
     if not _is_similar_base(base):
@@ -1139,7 +1514,7 @@ async def cb_similar_from(
     await _run_generation(
         status=status, user_id=call.from_user.id, mode="similar",
         target=SIMILAR_QUICK_TARGET, base=base,
-        checker=checker, storage=storage, cfg=cfg, quota=quota,
+        checker=checker, storage=storage, cfg=cfg, quota=quota, settings=settings,
     )
 
 
@@ -1158,11 +1533,12 @@ async def _run_generation(
     storage: FoundStorage,
     cfg: Config,
     quota: QuotaStorage,
+    settings: RuntimeSettings,
 ) -> None:
     async def body(run: _Run) -> None:
         await _generation_body(
             run=run, status=status, mode=mode, target=target, base=base,
-            checker=checker, storage=storage, cfg=cfg,
+            checker=checker, storage=storage, cfg=cfg, settings=settings,
         )
 
     await _start_run(kind=mode, user_id=user_id, status=status,
@@ -1179,9 +1555,12 @@ async def _generation_body(
     checker: TelegramChecker,
     storage: FoundStorage,
     cfg: Config,
+    settings: RuntimeSettings,
 ) -> None:
     found: list[tuple[str, int, str]] = []
     tested = 0
+    length = settings.name_length
+    min_score = settings.filter_min_score
     attempts_cap = target * GEN_MAX_FACTOR
     seen: set[str] = set(storage.claimed_names())   # «✓ Занял» не предлагаем
     last_edit = 0.0
@@ -1189,10 +1568,10 @@ async def _generation_body(
 
     def _next_batch(n: int) -> list[str]:
         if mode == "smart":
-            return generate_many(n, exclude=seen)
+            return generate_many(n, length=length, exclude=seen)
         if mode == "random":
-            return generate_many_random(n, exclude=seen)
-        return generate_similar(base or "", count=n, exclude=seen)
+            return generate_many_random(n, length=length, exclude=seen)
+        return generate_similar(base or "", count=n, length=length, exclude=seen)
 
     async def _tick(force: bool = False) -> None:
         nonlocal last_edit
@@ -1215,7 +1594,7 @@ async def _generation_body(
             await _tick()
             return
         sc, why = score_username(name)
-        if sc < cfg.filter_min_score:
+        if sc < min_score:
             await _tick()
             return
         found.append((name, sc, why))
@@ -1245,7 +1624,7 @@ async def _generation_body(
         seen.update(batch)
 
         flooded_for = await _check_many(
-            batch, run=run, checker=checker, concurrency=cfg.check_concurrency,
+            batch, run=run, checker=checker, concurrency=settings.check_concurrency,
             on_result=_on_result, should_stop=lambda: len(found) >= target,
         )
         if flooded_for is not None:
@@ -1260,7 +1639,7 @@ async def _generation_body(
                                    reply_markup=back_to_main())
             return
         rline = run.commit() if tested > 0 else run.usage_line()
-        await _edit_or_caption(status, B.gen_nothing_found(cfg.filter_min_score, tested, rline),
+        await _edit_or_caption(status, B.gen_nothing_found(min_score, tested, rline),
                                reply_markup=back_to_main())
         return
 
@@ -1288,6 +1667,7 @@ async def _generation_body(
 @router.callback_query(F.data == "bulk:start")
 async def cb_bulk_start(
     call: CallbackQuery, state: FSMContext, cfg: Config, quota: QuotaStorage,
+    settings: RuntimeSettings,
 ) -> None:
     user_id = call.from_user.id
     rem, limit = _remaining(user_id, cfg, quota), _limit_for(user_id, cfg, quota)
@@ -1299,7 +1679,9 @@ async def cb_bulk_start(
         await call.answer(B.MESSAGE_UNAVAILABLE, show_alert=True)
         return
     await state.set_state(BulkStates.waiting_list)
-    await _edit_or_caption(msg, B.bulk_intro(rem, limit, BULK_LIMIT), reply_markup=cancel_menu())
+    await _edit_or_caption(
+        msg, B.bulk_intro(rem, limit, settings.bulk_limit), reply_markup=cancel_menu(),
+    )
     await call.answer()
 
 
@@ -1311,13 +1693,14 @@ async def handle_bulk(
     storage: FoundStorage,
     cfg: Config,
     quota: QuotaStorage,
+    settings: RuntimeSettings,
 ) -> None:
     names = _parse_usernames(message.text or "")
     if not names:
         await message.answer(B.BULK_EMPTY, reply_markup=cancel_menu())
         return
-    if len(names) > BULK_LIMIT:
-        await message.answer(B.bulk_too_many(len(names), BULK_LIMIT),
+    if len(names) > settings.bulk_limit:
+        await message.answer(B.bulk_too_many(len(names), settings.bulk_limit),
                              reply_markup=cancel_menu())
         return
 
@@ -1331,7 +1714,8 @@ async def handle_bulk(
 
     async def body(run: _Run) -> None:
         await _bulk_body(run=run, status=status, names=names,
-                         checker=checker, storage=storage, cfg=cfg)
+                         checker=checker, storage=storage, cfg=cfg,
+                         settings=settings)
 
     await _start_run(kind="bulk", user_id=user_id, status=status,
                      cfg=cfg, quota=quota, body=body)
@@ -1345,6 +1729,7 @@ async def _bulk_body(
     checker: TelegramChecker,
     storage: FoundStorage,
     cfg: Config,
+    settings: RuntimeSettings,
 ) -> None:
     total = len(names)
     results: dict[str, CheckResult] = {}
@@ -1372,7 +1757,7 @@ async def _bulk_body(
             )
 
     flooded_for = await _check_many(
-        names, run=run, checker=checker, concurrency=cfg.check_concurrency,
+        names, run=run, checker=checker, concurrency=settings.check_concurrency,
         on_result=_on_result,
     )
 

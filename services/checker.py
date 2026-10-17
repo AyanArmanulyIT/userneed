@@ -21,10 +21,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -81,6 +83,71 @@ class AllSessionsFloodedError(RuntimeError):
         self.seconds_until_next = seconds_until_next
 
 
+class _DynamicSemaphore:
+    """
+    Семафор с изменяемым лимитом — для панели /params.
+
+    asyncio.Semaphore нельзя безопасно «расширить»: замена объекта
+    ломает release() у уже выполняющихся проверок. Здесь лимит меняется
+    на месте, а освободившиеся слоты сразу достаются ожидающим.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self) -> None:
+        if self._active < self._limit:
+            self._active += 1
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                # Слот уже передали нам, но задача отменилась — отдаём дальше.
+                self.release()
+            else:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(fut)
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if fut.done():
+                continue
+            fut.set_result(None)
+            return
+        self._active = max(0, self._active - 1)
+
+    def set_limit(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        while self._active < self._limit and self._waiters:
+            fut = self._waiters.popleft()
+            if fut.done():
+                continue
+            self._active += 1
+            fut.set_result(None)
+
+    async def __aenter__(self) -> _DynamicSemaphore:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.release()
+
+
 def is_valid_username_format(username: str) -> bool:
     """Формат Telegram: 5-32 символа, латиница/цифры/_, без «__»."""
     if not 5 <= len(username) <= 32:
@@ -133,6 +200,7 @@ class TelegramChecker:
         session_names: list[str],
         *,
         concurrency: int = 4,
+        retries: int = MAX_RETRIES,
         flood_extra: int = 3,
         park_threshold: int = 300,
         delay_min: float = 0.8,
@@ -150,7 +218,8 @@ class TelegramChecker:
             for n, c in zip(session_names, clients)
         ]
         self._index = 0
-        self._sem = asyncio.Semaphore(max(1, concurrency))
+        self._sem = _DynamicSemaphore(concurrency)
+        self._max_retries = max(1, int(retries))
 
         self._flood_extra = max(0, flood_extra)
         self._park_threshold = max(30, park_threshold)
@@ -279,7 +348,7 @@ class TelegramChecker:
                     return "taken"
 
             # --- MTProto с ретраями по сессиям ---
-            for _ in range(self.MAX_RETRIES):
+            for _ in range(self._max_retries):
                 session = self._next_session()
                 await self._human_delay(session)
 
@@ -328,7 +397,7 @@ class TelegramChecker:
                 self._remember(username, result)
                 return result
 
-            logger.warning("@%s: исчерпаны попытки (%d)", username, self.MAX_RETRIES)
+            logger.warning("@%s: исчерпаны попытки (%d)", username, self._max_retries)
             self._stats["error"] += 1
             return "error"
 

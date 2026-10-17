@@ -15,7 +15,13 @@
 """
 from __future__ import annotations
 
+import time
+from typing import TYPE_CHECKING, Any
+
 from bot.utils import esc
+
+if TYPE_CHECKING:  # только для аннотаций — рантайм-цикла нет
+    from services.runtime_settings import ParamSpec, RuntimeSettings
 
 BOT_NAME = "UserNeed"
 
@@ -85,6 +91,11 @@ def welcome(
         "<b>06</b>  ·  Связаться с админом",
         "        Вопросы, идеи, ошибки",
     ]
+    if show_watch:
+        modules += [
+            "<b>07</b>  ·  Параметры прогонов",
+            "        Только операторы: ретраи, паузы, длина",
+        ]
 
     return (
         f"<b>USERNEED</b>  ·  информационная система\n"
@@ -122,7 +133,19 @@ MESSAGE_UNAVAILABLE = "Сообщение устарело. Отправьте /
 #                          Модуль 05 · Регламент
 # =============================================================================
 
-def help_text(limit: int, bulk_limit: int, timeout_minutes: int) -> str:
+def help_text(
+    limit: int,
+    bulk_limit: int,
+    timeout_minutes: int,
+    is_admin: bool = False,
+) -> str:
+    admin_block = (
+        "<b>Команды оператора:</b>\n"
+        "  /params — параметры проверки и генерации;\n"
+        "  /stats — состояние сервиса, /sessions — сессии.\n\n"
+        if is_admin
+        else ""
+    )
     return (
         f"<b>МОДУЛЬ 05 · РЕГЛАМЕНТ</b>\n"
         f"{DOT}\n"
@@ -142,6 +165,7 @@ def help_text(limit: int, bulk_limit: int, timeout_minutes: int) -> str:
         f"<b>Лимиты:</b>\n"
         f"  ·  <b>{limit}</b> сеанса(ов) на участника — генерация или "
         f"пакетная проверка (до {bulk_limit} имён за раз);\n"
+        f"  ·  длина подбираемых имён — 5–8 символов (задаёт оператор);\n"
         f"  ·  сеанс списывается только после завершения обработки — "
         f"при перегрузке, сбое или таймауте не списывается;\n"
         f"  ·  одновременно выполняется одна обработка на всю систему — "
@@ -152,6 +176,7 @@ def help_text(limit: int, bulk_limit: int, timeout_minutes: int) -> str:
         f"  /help — этот регламент\n"
         f"  /found — история находок\n"
         f"  /cancel — сбросить текущий ввод\n\n"
+        f"{admin_block}"
         f"<i>Вопросы и предложения — через модуль 06.</i>"
     )
 
@@ -961,3 +986,289 @@ def quota_reset_done(user_id: int, limit: int) -> str:
         f"✓ Квота пользователя <code>{user_id}</code> сброшена: "
         f"доступно <b>{limit}</b> сеансов."
     )
+
+
+# =============================================================================
+#                    Модуль 07 · Параметры (только операторы)
+# =============================================================================
+
+SETTINGS_GROUP_TITLES = {"check": "ПРОВЕРКА", "gen": "ГЕНЕРАЦИЯ"}
+SETTINGS_GROUP_BUTTONS = {"check": "Проверка", "gen": "Генерация"}
+
+SETTINGS_LABELS = {
+    "check_retries": "Попыток на ник",
+    "check_concurrency": "Параллельных проверок",
+    "check_delay_min": "Пауза от",
+    "check_delay_max": "Пауза до",
+    "http_precheck": "HTTP-пречек",
+    "name_length": "Длина имён",
+    "filter_min_score": "Минимальная оценка",
+    "gen_max_smart": "Макс. осмысленных",
+    "gen_max_random": "Макс. случайных",
+    "bulk_limit": "Имён в пакете",
+}
+
+SETTINGS_UNITS = {
+    "check_delay_min": "с",
+    "check_delay_max": "с",
+    "name_length": "симв.",
+    "gen_max_smart": "имён",
+    "gen_max_random": "имён",
+    "bulk_limit": "имён",
+}
+
+SETTINGS_HINTS = {
+    "check_retries": (
+        "Сколько раз пробовать один ник, если сессии заняты, дают сбой "
+        "или уходят в FloodWait. Больше попыток — выше шанс получить "
+        "ответ, но дольше прогон."
+    ),
+    "check_concurrency": (
+        "Сколько проверок идёт одновременно. Выше — быстрее, но выше "
+        "риск FloodWait. Безопасный диапазон — 2–6."
+    ),
+    "check_delay_min": (
+        "Нижняя граница случайной паузы между запросами одной сессии. "
+        "Слишком маленькая пауза провоцирует FloodWait."
+    ),
+    "check_delay_max": (
+        "Верхняя граница случайной паузы между запросами одной сессии."
+    ),
+    "http_precheck": (
+        "Быстрый отсев занятых имён через t.me без MTProto. Отключайте "
+        "только при проблемах с сетью или блокировке t.me."
+    ),
+    "name_length": (
+        "Длина генерируемых имён. 5 — максимум качества (словари и "
+        "скоринг заточены под неё), 6–8 — словари слов 5–7 и имён 5–8."
+    ),
+    "filter_min_score": (
+        "Имена с оценкой ниже не показываются в результатах. "
+        "1 — показывать всё, 10 — только идеальные."
+    ),
+    "gen_max_smart": (
+        "Максимум осмысленных имён за один сеанс. Верхняя граница — 30."
+    ),
+    "gen_max_random": (
+        "Максимум случайных сочетаний за один сеанс. Верхняя граница — 50."
+    ),
+    "bulk_limit": (
+        "Сколько имён принимает пакетная проверка за один сеанс. "
+        "Большие списки идут дольше и чаще упираются в таймаут."
+    ),
+}
+
+
+def _settings_num(value: float | int, digits: int = 0) -> str:
+    if digits:
+        return f"{float(value):.{digits}f}".replace(".", ",")
+    return str(int(value))
+
+
+def settings_value(spec: ParamSpec, value: Any) -> str:
+    """Число + единица измерения; bool → вкл/выкл."""
+    if spec.kind == "bool":
+        return "вкл" if value else "выкл"
+    unit = SETTINGS_UNITS.get(spec.key, "")
+    number = _settings_num(value, spec.digits)
+    return f"{number} {unit}".strip()
+
+
+def settings_default_value(spec: ParamSpec) -> str:
+    return settings_value(spec, spec.default)
+
+
+def settings_range(spec: ParamSpec) -> str:
+    unit = SETTINGS_UNITS.get(spec.key, "")
+    text = f"{_settings_num(spec.minimum, spec.digits)}–{_settings_num(spec.maximum, spec.digits)}"
+    return f"{text} {unit}".strip()
+
+
+def settings_step_text(spec: ParamSpec) -> str:
+    return _settings_num(spec.step, spec.digits)
+
+
+def _settings_when(ts: float) -> str:
+    return time.strftime("%d.%m %H:%M", time.localtime(ts))
+
+
+def _settings_label(key: str) -> str:
+    return SETTINGS_LABELS.get(key, key)
+
+
+def settings_panel(settings: RuntimeSettings) -> str:
+    lines = [
+        "<b>ПАРАМЕТРЫ ПРОГОНОВ</b>",
+        DOT,
+        "Только для операторов. Чекер подхватывает изменения на ходу, "
+        "генерация — со следующего прогона. Всё сохраняется в SQLite "
+        "и переживает перезапуск.",
+        "",
+        "Приоритет: <i>.env → переопределения панели</i>.",
+    ]
+    for group, specs in settings.grouped().items():
+        lines += ["", f"<b>{SETTINGS_GROUP_TITLES.get(group, group.upper())}</b>"]
+        for spec in specs:
+            value = settings_value(spec, settings.get(spec.key))
+            mark = "  ✎" if settings.has_override(spec.key) else ""
+            lines.append(f"  · {_settings_label(spec.key)}: <b>{value}</b>{mark}")
+    lines += [
+        "",
+        f"Переопределено: <b>{settings.override_count()}</b> "
+        f"из {len(settings.specs())}",
+    ]
+    last = settings.last_change()
+    if last:
+        actor = esc(str(last.get("actor") or last.get("user_id") or "—"))
+        lines.append(
+            f"Последнее: <code>{_settings_when(float(last['ts']))}</code> · "
+            f"{actor} · {_settings_label(str(last['key']))}"
+        )
+    else:
+        lines.append("<i>Изменений ещё не было — действуют значения из .env.</i>")
+    lines += [
+        "",
+        "<i>✎ — значение переопределено в панели.</i>",
+        "<i>Нажмите группу, чтобы изменить параметры.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def settings_group(settings: RuntimeSettings, group: str) -> str:
+    title = SETTINGS_GROUP_TITLES.get(group, group.upper())
+    lines = [
+        f"<b>ПАРАМЕТРЫ · {title}</b>",
+        DOT,
+        "Нажмите параметр, чтобы изменить его.",
+    ]
+    for spec in settings.grouped().get(group, []):
+        value = settings_value(spec, settings.get(spec.key))
+        mark = "  ·  <i>изменён</i>" if settings.has_override(spec.key) else ""
+        lines.append(f"  · {_settings_label(spec.key)}: <b>{value}</b>{mark}")
+    lines += ["", "<i>Изменения действуют на всю систему.</i>"]
+    return "\n".join(lines)
+
+
+def settings_param(settings: RuntimeSettings, spec: ParamSpec, saved: bool = False) -> str:
+    value = settings_value(spec, settings.get(spec.key))
+    source = "панель" if settings.has_override(spec.key) else ".env"
+    header = "ПАРАМЕТР СОХРАНЁН" if saved else "ПАРАМЕТР"
+    lines = [
+        f"<b>{header}</b>",
+        DOT,
+        f"<b>{_settings_label(spec.key)}</b>",
+        "",
+        f"Текущее значение: <b>{value}</b>",
+        f"По умолчанию (.env): {settings_default_value(spec)}",
+        f"Источник: {source}",
+    ]
+    if spec.kind != "bool":
+        lines.append(f"Диапазон: {settings_range(spec)}")
+    lines += ["", f"<i>{SETTINGS_HINTS.get(spec.key, '')}</i>"]
+    return "\n".join(lines)
+
+
+def settings_prompt(settings: RuntimeSettings, spec: ParamSpec) -> str:
+    lines = [
+        "<b>НОВОЕ ЗНАЧЕНИЕ</b>",
+        DOT,
+        f"Параметр: <b>{_settings_label(spec.key)}</b>",
+        f"Сейчас: <b>{settings_value(spec, settings.get(spec.key))}</b>",
+    ]
+    if spec.kind == "bool":
+        lines.append("Введите: <code>вкл</code> или <code>выкл</code>.")
+    else:
+        lines.append(f"Диапазон: {settings_range(spec)}")
+        lines.append(
+            "Можно ввести число с точкой или запятой, например "
+            "<code>0,5</code>."
+        )
+    lines += ["", "<i>Отправьте /cancel, чтобы выйти без изменений.</i>"]
+    return "\n".join(lines)
+
+
+def settings_saved_alert(spec: ParamSpec, value: Any) -> str:
+    return f"Сохранено: {_settings_label(spec.key)} = {settings_value(spec, value)}"
+
+
+def settings_error_text(
+    code: str,
+    spec: ParamSpec,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> str:
+    if code == "int":
+        return "Нужно целое число. Пример: <code>6</code>."
+    if code == "float":
+        return "Нужно число. Пример: <code>0,5</code> или <code>1.5</code>."
+    if code == "bool":
+        return "Нужно <code>вкл</code> или <code>выкл</code> (можно 1/0)."
+    if code == "range":
+        lo = minimum if minimum is not None else spec.minimum
+        hi = maximum if maximum is not None else spec.maximum
+        return (
+            f"Вне диапазона. Допустимо: <b>{_settings_num(lo, spec.digits)}–"
+            f"{_settings_num(hi, spec.digits)}</b> {SETTINGS_UNITS.get(spec.key, '')}".rstrip()
+        )
+    if code == "delay_order":
+        return (
+            "Пауза «от» не может быть больше паузы «до». "
+            "Сначала измените вторую."
+        )
+    return "Неизвестный параметр."
+
+
+SETTINGS_BAD_PARAM = "Неизвестный параметр."
+SETTINGS_BAD_GROUP = "Неизвестная группа параметров."
+SETTINGS_NOT_OVERRIDDEN = "Параметр и так берётся из .env — сбрасывать нечего."
+SETTINGS_TEXT_EXPECTED = (
+    "Нужно текстовое значение: число или <code>вкл</code>/<code>выкл</code>."
+)
+
+
+def settings_reset_alert(spec: ParamSpec) -> str:
+    return f"Сброшено к .env: {_settings_label(spec.key)} = {settings_default_value(spec)}"
+
+
+def settings_confirm_reset_all(count: int) -> str:
+    return (
+        "<b>СБРОСИТЬ ВСЕ ПАРАМЕТРЫ?</b>\n"
+        f"{DOT}\n"
+        f"Будет удалено переопределений: <b>{count}</b>.\n\n"
+        "Все значения вернутся к тем, что заданы в <code>.env</code>: "
+        "ретраи, паузы, параллельность, длина имён, лимиты. "
+        "Действующие прогоны это не прервёт.\n\n"
+        "<i>Действие записывается в журнал.</i>"
+    )
+
+
+def settings_reset_all_done(count: int) -> str:
+    return f"✓ Сброшено переопределений: <b>{count}</b>. Действуют значения из .env."
+
+
+SETTINGS_EMPTY_LOG = "Журнал пуст — параметры ещё не менялись."
+
+
+def settings_log(settings: RuntimeSettings, rows: list[dict[str, Any]]) -> str:
+    lines = ["<b>ЖУРНАЛ ИЗМЕНЕНИЙ</b>", DOT]
+    if not rows:
+        lines.append(SETTINGS_EMPTY_LOG)
+        return "\n".join(lines)
+    for index, row in enumerate(rows, 1):
+        key = str(row.get("key", ""))
+        old_raw = str(row.get("old_value", ""))
+        new_raw = str(row.get("new_value", ""))
+        if key in SETTINGS_LABELS:
+            spec = settings.spec(key)
+            old = settings_value(spec, settings.value_from_raw(key, old_raw))
+            new = settings_value(spec, settings.value_from_raw(key, new_raw))
+        else:  # запись от старой версии — показываем как есть
+            old, new = old_raw, new_raw
+        actor = esc(str(row.get("actor") or row.get("user_id") or "—"))
+        when = _settings_when(float(row.get("ts", 0)))
+        lines.append(
+            f"{index}. <code>{when}</code> · {actor}\n"
+            f"    {_settings_label(key)}: {old} → <b>{new}</b>"
+        )
+    lines += ["", "<i>Показаны последние изменения.</i>"]
+    return "\n".join(lines)

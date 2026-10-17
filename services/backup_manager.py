@@ -2,7 +2,8 @@
 BackupManager — суточные бэкапы ключевых файлов проекта.
 
 Что кладёт в архив (всегда):
-  · found.db, watchlist.db, fsm.db, feedback.db, quota.db, check_cache.db
+  · found.db, watchlist.db, fsm.db, feedback.db, quota.db, check_cache.db,
+    settings.db (переопределения параметров прогонов)
   · assets/ — баннер, словари
 
 Что кладёт ТОЛЬКО при include_secrets=True (BACKUP_INCLUDE_SECRETS=1):
@@ -41,7 +42,7 @@ MAX_BACKUPS = 20
 
 DB_FILES = (
     "found.db", "watchlist.db", "fsm.db",
-    "feedback.db", "quota.db", "check_cache.db",
+    "feedback.db", "quota.db", "check_cache.db", "settings.db",
 )
 
 _LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -4,7 +4,7 @@
 Порядок старта:
   1. Конфиг (.env) → логи в data_dir/logs.
   2. Словари генератора.
-  3. Хранилища: found, feedback, quota, check_cache (все в data_dir).
+  3. Хранилища: found, feedback, quota, check_cache, settings (все в data_dir).
   4. Telethon-пул → TelegramChecker.
   5. aiogram: Bot, SQLite FSM, middleware (доступ — outer), роутер.
   6. Фоновые сервисы: Watchlist, SessionGuard, DailyReporter, BackupManager.
@@ -43,6 +43,7 @@ from services.daily_report import DailyReporter
 from services.feedback import FeedbackStorage
 from services.generator import dictionary_size, reload_external_dicts, stopwords_count
 from services.quota import QuotaStorage
+from services.runtime_settings import RuntimeSettings
 from services.session_guard import SessionGuard
 from services.sqlite_fsm import SQLiteStorage
 from services.storage import FoundStorage
@@ -57,6 +58,7 @@ USER_COMMANDS = [
     BotCommand(command="cancel", description="Сбросить текущий ввод"),
 ]
 ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand(command="params", description="Параметры прогонов"),
     BotCommand(command="stats", description="Состояние сервиса"),
     BotCommand(command="sessions", description="Состояние сессий"),
     BotCommand(command="today", description="Статистика за сутки"),
@@ -199,6 +201,15 @@ async def main() -> None:
         check_cache = CheckCache(path=cfg.db_path("check_cache.db"))
         stack.callback(check_cache.close)
 
+        # Переопределения параметров из панели /params. Читаются на каждом
+        # прогоне; чекер получает новые значения через bind_checker().
+        runtime = RuntimeSettings(path=cfg.db_path("settings.db"), cfg=cfg)
+        stack.callback(runtime.close)
+        if runtime.override_count():
+            logger.info(
+                "Панель параметров: %d переопределений из settings.db", runtime.override_count(),
+            )
+
         # --- Telethon ---
         clients, names = await _start_all_clients(cfg)
         stack.push_async_callback(_disconnect_all, clients)
@@ -214,16 +225,18 @@ async def main() -> None:
         checker = TelegramChecker(
             clients=clients,
             session_names=names,
-            concurrency=cfg.check_concurrency,
+            concurrency=runtime.check_concurrency,
+            retries=runtime.check_retries,
             flood_extra=cfg.flood_cooldown_extra,
             park_threshold=cfg.flood_park_threshold,
-            delay_min=cfg.check_delay_min,
-            delay_max=cfg.check_delay_max,
-            http_precheck_enabled=cfg.http_precheck_enabled,
+            delay_min=runtime.check_delay_min,
+            delay_max=runtime.check_delay_max,
+            http_precheck_enabled=runtime.http_precheck,
             cache=check_cache,
         )
         await checker.start()
         stack.push_async_callback(checker.aclose)
+        runtime.bind_checker(checker)
 
         # --- aiogram ---
         bot = Bot(
@@ -317,6 +330,7 @@ async def main() -> None:
                 feedback=feedback,
                 quota=quota,
                 check_cache=check_cache,
+                settings=runtime,
                 guard=guard,
                 reporter=reporter,
                 backup_mgr=backup,

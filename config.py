@@ -145,6 +145,7 @@ class Config:
 
     # Чекер
     check_concurrency: int
+    check_retries: int
     flood_cooldown_extra: int
     flood_park_threshold: int
     check_delay_min: float
@@ -156,6 +157,8 @@ class Config:
     gen_max_smart: int
     gen_max_random: int
     gen_busy_retry_hint: int
+    name_length: int
+    bulk_limit: int
 
     # Хранилище
     storage_enabled: bool
@@ -265,6 +268,11 @@ def load_config() -> Config:
     gen_max_smart = max(3, min(30, _get_int("GEN_MAX_SMART", 10)))
     gen_max_random = max(5, min(50, _get_int("GEN_MAX_RANDOM", 20)))
 
+    # Длина имён: генератор поддерживает 5–8 (имена в словаре — 5–8, слова — 5–7).
+    name_length = max(5, min(8, _get_int("NAME_LENGTH", 5)))
+    # Сколько имён принимает пакетная проверка за один сеанс.
+    bulk_limit = max(10, min(2000, _get_int("BULK_LIMIT", 200)))
+
     data_dir = _resolve_path(_get_str("DATA_DIR"), PROJECT_ROOT)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -283,6 +291,7 @@ def load_config() -> Config:
         session_names=session_names,
 
         check_concurrency=max(1, _get_int("CHECK_CONCURRENCY", 4)),
+        check_retries=max(1, min(12, _get_int("CHECK_RETRIES", 6))),
         flood_cooldown_extra=max(0, _get_int("FLOOD_COOLDOWN_EXTRA", 3)),
         flood_park_threshold=max(30, _get_int("FLOOD_PARK_THRESHOLD", 300)),
         check_delay_min=max(0.0, delay_min),
@@ -293,6 +302,8 @@ def load_config() -> Config:
         gen_max_smart=gen_max_smart,
         gen_max_random=gen_max_random,
         gen_busy_retry_hint=max(10, _get_int("GEN_BUSY_RETRY_HINT", 45)),
+        name_length=name_length,
+        bulk_limit=bulk_limit,
 
         storage_enabled=_get_bool("STORAGE_ENABLED", True),
         found_history_days=max(1, _get_int("FOUND_HISTORY_DAYS", 30)),
@@ -327,6 +338,10 @@ if __name__ == "__main__":
     print(f"  • STORAGE_ENABLED:      {cfg.storage_enabled}")
     print(f"  • FOUND_HISTORY_DAYS:   {cfg.found_history_days}")
     print(f"  • USE_EXTERNAL_DICT:    {cfg.use_external_dict}")
+    print(f"  • NAME_LENGTH:          {cfg.name_length}")
+    print(f"  • BULK_LIMIT:           {cfg.bulk_limit}")
+    print(f"  • CHECK_CONCURRENCY:    {cfg.check_concurrency}")
+    print(f"  • CHECK_RETRIES:        {cfg.check_retries}")
     print(f"  • SIMILAR_MAX_RESULTS:  {cfg.similar_max_results}")
     print(f"  • FILTER_MIN_SCORE:     {cfg.filter_min_score}")
     print(f"  • WATCH_INTERVALS:      "

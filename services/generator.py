@@ -12,9 +12,14 @@
   • Приоритет редких букв (q, z, x, j, w) — там плотность свободных
     выше в 5-10 раз, чем у имён на частые буквы.
   • Стоп-слова (assets/stopwords.txt) — исключаем the/and/for до проверки.
-  • Для генерации используются ТОЛЬКО 5-буквенные слова/имена: раньше
-    в пул попадали слова на 6-7 букв, которые потом отбрасывал фильтр
-    длины — три четверти словаря тратились впустую.
+  • Словари разложены по длинам: 5-буквенные идут в пул по умолчанию,
+    а 6-8-буквенные — в отдельные пулы для настраиваемой длины.
+
+Длина имени (NAME_LENGTH / панель /params):
+  • 5 — историческое поведение, максимум качества;
+  • 6-8 — словари проекта содержат слова и имена такой длины, поэтому
+    осмысленная генерация сохраняется;
+  • 9+ не поддерживаем: словарей нет, качество падает до скрэмбла.
 
 Словари (assets/):
   words.txt, words_5.txt — английские слова (5-7 букв / только 5);
@@ -47,8 +52,10 @@ _FINALS = "lmnrst" * 2 + "xzjkwv" * 5
 _SCRAMBLE = "bcdfghjklmnprstvwxyz"
 _RARE_FIRST = "qzxjwv"
 
-# Длина имени, под которую заточены стратегии.
+# Длина имени по умолчанию и поддерживаемый диапазон.
 DEFAULT_LENGTH = 5
+MIN_LENGTH = 5
+MAX_LENGTH = 8
 
 
 # =============================================================================
@@ -130,6 +137,11 @@ _POOL_WORDS_5: tuple[str, ...] = ()
 _POOL_NAMES_5: tuple[str, ...] = ()
 _POOL_DICT_5: tuple[str, ...] = ()
 
+# Пулы по длинам 5..MAX_LENGTH. 5-й пул совпадает с *_5 выше.
+_POOL_WORDS_BY_LENGTH: dict[int, tuple[str, ...]] = {}
+_POOL_NAMES_BY_LENGTH: dict[int, tuple[str, ...]] = {}
+_POOL_DICT_BY_LENGTH: dict[int, tuple[str, ...]] = {}
+
 
 def reload_external_dicts(use_external: bool = True) -> None:
     """
@@ -140,13 +152,14 @@ def reload_external_dicts(use_external: bool = True) -> None:
     """
     global _EXT_WORDS, _EXT_NAMES, _EXT_WORDS_SET, _EXT_NAMES_SET, _STOPWORDS
     global _POOL_WORDS_5, _POOL_NAMES_5, _POOL_DICT_5
+    global _POOL_WORDS_BY_LENGTH, _POOL_NAMES_BY_LENGTH, _POOL_DICT_BY_LENGTH
 
     _STOPWORDS = frozenset(_read_words(_ASSETS / "stopwords.txt", 1, 32))
 
     if use_external:
-        raw_words = _read_words(_ASSETS / "words.txt", 5, 8)
+        raw_words = _read_words(_ASSETS / "words.txt", MIN_LENGTH, MAX_LENGTH)
         raw_words += _read_words(_ASSETS / "words_5.txt", 5, 5)
-        raw_names = _read_words(_ASSETS / "names.txt", 5, 8)
+        raw_names = _read_words(_ASSETS / "names.txt", MIN_LENGTH, MAX_LENGTH)
         _EXT_WORDS = [w for w in dict.fromkeys(raw_words) if w not in _STOPWORDS]
         _EXT_NAMES = [w for w in dict.fromkeys(raw_names) if w not in _STOPWORDS]
     else:
@@ -155,11 +168,33 @@ def reload_external_dicts(use_external: bool = True) -> None:
     _EXT_WORDS_SET = frozenset(_EXT_WORDS)
     _EXT_NAMES_SET = frozenset(_EXT_NAMES)
 
-    builtin_5 = [w for w in _BUILTIN_WORDS if w not in _STOPWORDS]
-    ext_5 = [w for w in _EXT_WORDS if len(w) == DEFAULT_LENGTH]
-    _POOL_WORDS_5 = tuple(dict.fromkeys(builtin_5 + ext_5))
-    _POOL_NAMES_5 = tuple(w for w in _EXT_NAMES if len(w) == DEFAULT_LENGTH)
-    _POOL_DICT_5 = _POOL_WORDS_5 + _POOL_NAMES_5
+    builtin = [w for w in _BUILTIN_WORDS if w not in _STOPWORDS]
+    words_by_length: dict[int, list[str]] = {n: [] for n in range(MIN_LENGTH, MAX_LENGTH + 1)}
+    names_by_length: dict[int, list[str]] = {n: [] for n in range(MIN_LENGTH, MAX_LENGTH + 1)}
+    for word in builtin:
+        if MIN_LENGTH <= len(word) <= MAX_LENGTH:
+            words_by_length[len(word)].append(word)
+    for word in _EXT_WORDS:
+        if MIN_LENGTH <= len(word) <= MAX_LENGTH:
+            words_by_length[len(word)].append(word)
+    for name in _EXT_NAMES:
+        if MIN_LENGTH <= len(name) <= MAX_LENGTH:
+            names_by_length[len(name)].append(name)
+
+    _POOL_WORDS_BY_LENGTH = {
+        n: tuple(dict.fromkeys(items)) for n, items in words_by_length.items()
+    }
+    _POOL_NAMES_BY_LENGTH = {
+        n: tuple(dict.fromkeys(items)) for n, items in names_by_length.items()
+    }
+    _POOL_DICT_BY_LENGTH = {
+        n: _POOL_WORDS_BY_LENGTH[n] + _POOL_NAMES_BY_LENGTH[n]
+        for n in range(MIN_LENGTH, MAX_LENGTH + 1)
+    }
+
+    _POOL_WORDS_5 = _POOL_WORDS_BY_LENGTH[MIN_LENGTH]
+    _POOL_NAMES_5 = _POOL_NAMES_BY_LENGTH[MIN_LENGTH]
+    _POOL_DICT_5 = _POOL_DICT_BY_LENGTH[MIN_LENGTH]
 
 
 def _is_word(name: str) -> bool:
@@ -251,23 +286,6 @@ def _gen_status() -> str:
     return f"{first}_{random.choice(_COOL_NUMBERS)}"
 
 
-def _gen_scramble() -> str:
-    """
-    Случайное сочетание. Первой ставим редкую букву (в 60% случаев) —
-    это повышает шанс попадания в свободное имя.
-    """
-    first = random.choice(_RARE_FIRST) if random.random() < 0.6 else random.choice(_SCRAMBLE)
-    rest = "".join(
-        random.choice(_SCRAMBLE + (VOWELS if random.random() < 0.3 else ""))
-        for _ in range(DEFAULT_LENGTH - 1)
-    )
-    return first + rest
-
-
-def _gen_scramble_mixed() -> str:
-    return _gen_scramble()[:DEFAULT_LENGTH - 1] + random.choice(DIGITS)
-
-
 # =============================================================================
 #                             Микс стратегий
 # =============================================================================
@@ -291,6 +309,64 @@ def _pick_generator() -> Callable[[], str]:
 def _gen_smart() -> str:
     """Случайная стратегия из микса."""
     return _pick_generator()()
+
+
+# =============================================================================
+#                    Длина 6–8: те же стратегии, но с подгонкой
+# =============================================================================
+
+def _syllabic_length(length: int) -> str:
+    """CV-слоги до нужной длины. Для 6-8 даёт читаемые имена."""
+    out: list[str] = []
+    while len(out) < length:
+        out.append(random.choice(INITIALS))
+        if len(out) < length:
+            out.append(random.choice(VOWELS))
+    return "".join(out)
+
+
+def _fit_length(candidate: str, length: int) -> str:
+    """Подгоняет готовый кандидат под длину: обрезает или добивает буквами."""
+    if len(candidate) >= length:
+        return candidate[:length]
+    return candidate + "".join(
+        random.choice(LETTERS) for _ in range(length - len(candidate))
+    )
+
+
+def _scramble_length(length: int) -> str:
+    """Случайное сочетание нужной длины с приоритетом редкой первой буквы."""
+    first = random.choice(_RARE_FIRST) if random.random() < 0.6 else random.choice(_SCRAMBLE)
+    rest = "".join(
+        random.choice(_SCRAMBLE + (VOWELS if random.random() < 0.3 else ""))
+        for _ in range(max(0, length - 1))
+    )
+    return first + rest
+
+
+def _gen_smart_length(length: int) -> str:
+    """
+    Осмысленное имя длины 6–8.
+
+    Приоритет — словарь нужной длины (там реальные слова и имена), затем
+    слоги, брендовый шаблон и только в конце скрэмбл.
+    """
+    pool = _POOL_DICT_BY_LENGTH.get(length, ())
+    r = random.random()
+    if pool and r < 0.60:
+        return random.choice(pool)
+    if r < 0.82:
+        return _syllabic_length(length)
+    if r < 0.92:
+        return _fit_length(_gen_brand(), length)
+    return _scramble_length(length)
+
+
+def _gen_random_length(length: int) -> str:
+    """Случайное сочетание длины 6–8; изредка с цифрой в конце."""
+    if random.random() < 0.15 and length > 1:
+        return _scramble_length(length - 1) + random.choice(DIGITS)
+    return _scramble_length(length)
 
 
 # =============================================================================
@@ -393,10 +469,19 @@ def generate_many(
     length: int = DEFAULT_LENGTH,
     exclude: set[str] | None = None,
 ) -> list[str]:
-    """Осмысленные имена. exclude — что не предлагать (уже проверенные)."""
-    if length != DEFAULT_LENGTH:
+    """
+    Осмысленные имена. exclude — что не предлагать (уже проверенные).
+
+    Длины 5–8 поддерживаются полноценно; всё, что вне диапазона,
+    деградирует до случайных букв через _fallback (вызывающий код
+    ограничивает длину настройкой NAME_LENGTH).
+    """
+    length = max(2, int(length))
+    if not MIN_LENGTH <= length <= MAX_LENGTH:
         return _generate_batch(count, length, lambda: _fallback(length), exclude)
-    return _generate_batch(count, length, _gen_smart, exclude)
+    if length == DEFAULT_LENGTH:
+        return _generate_batch(count, length, _gen_smart, exclude)
+    return _generate_batch(count, length, lambda: _gen_smart_length(length), exclude)
 
 
 def generate_many_random(
@@ -405,13 +490,12 @@ def generate_many_random(
     exclude: set[str] | None = None,
 ) -> list[str]:
     """Случайные сочетания. exclude — что не предлагать."""
-    if length != DEFAULT_LENGTH:
+    length = max(2, int(length))
+    if not MIN_LENGTH <= length <= MAX_LENGTH:
         return _generate_batch(count, length, lambda: _fallback(length), exclude)
-
-    def strategy() -> str:
-        return _gen_scramble_mixed() if random.random() < 0.15 else _gen_scramble()
-
-    return _generate_batch(count, length, strategy, exclude)
+    return _generate_batch(
+        count, length, lambda: _gen_random_length(length), exclude
+    )
 
 
 def _generate_batch(
@@ -619,9 +703,12 @@ def generate_similar(
 #                              Утилиты
 # =============================================================================
 
-def dictionary_size() -> tuple[int, int]:
-    """(слов для генерации, имён для генерации) — только 5-буквенные."""
-    return len(_POOL_WORDS_5), len(_POOL_NAMES_5)
+def dictionary_size(length: int = DEFAULT_LENGTH) -> tuple[int, int]:
+    """(слов, имён) для генерации указанной длины; по умолчанию — 5."""
+    return (
+        len(_POOL_WORDS_BY_LENGTH.get(length, ())),
+        len(_POOL_NAMES_BY_LENGTH.get(length, ())),
+    )
 
 
 def stopwords_count() -> int:

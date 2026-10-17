@@ -22,6 +22,8 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     kb.button(text="04  ·  История находок",     callback_data="found:show")
     kb.button(text="05  ·  Регламент",           callback_data="help")
     kb.button(text="06  ·  Связаться с админом", callback_data="feedback:start")
+    if is_admin:
+        kb.button(text="07  ·  Параметры прогонов", callback_data="settings:open")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -123,4 +125,71 @@ def back_to_main() -> InlineKeyboardMarkup:
 def cancel_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=BTN_CANCEL, callback_data="menu:main")
+    return kb.as_markup()
+
+
+# =============================================================================
+#                    Модуль 07 · Параметры (только операторы)
+# =============================================================================
+
+def settings_panel_kb(overrides: int) -> InlineKeyboardMarkup:
+    """Панель: две группы, журнал и (при наличии) полный сброс."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Проверка",          callback_data="settings:group:check")
+    kb.button(text="Генерация",         callback_data="settings:group:gen")
+    kb.button(text="Журнал изменений",  callback_data="settings:log")
+    if overrides:
+        kb.button(text=f"Сбросить все · {overrides}", callback_data="settings:reset_all")
+    kb.button(text=BTN_BACK,            callback_data="menu:main")
+    kb.adjust(2, 1, 1, 1, 1)
+    return kb.as_markup()
+
+
+def settings_group_kb(group: str, items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """items — пары (ключ параметра, подпись кнопки с текущим значением)."""
+    kb = InlineKeyboardBuilder()
+    for key, text in items:
+        kb.button(text=text, callback_data=f"settings:edit:{key}")
+    kb.button(text=BTN_BACK, callback_data="settings:open")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def settings_param_kb(
+    key: str,
+    group: str,
+    *,
+    is_bool: bool,
+    step_text: str,
+    has_override: bool,
+) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if is_bool:
+        kb.button(text="Переключить", callback_data=f"settings:toggle:{key}")
+    else:
+        kb.button(text=f"− {step_text}", callback_data=f"settings:dec:{key}")
+        kb.button(text=f"+ {step_text}", callback_data=f"settings:inc:{key}")
+        kb.button(text="Ввести значение", callback_data=f"settings:ask:{key}")
+    if has_override:
+        kb.button(text="Сбросить к .env", callback_data=f"settings:reset:{key}")
+    kb.button(text=BTN_BACK, callback_data=f"settings:group:{group}")
+    if is_bool:
+        kb.adjust(1, 1, 1)
+    else:
+        kb.adjust(2, 1, 1, 1)
+    return kb.as_markup()
+
+
+def settings_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да, сбросить всё", callback_data="settings:reset_all_yes")
+    kb.button(text=BTN_CANCEL,         callback_data="settings:open")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def settings_back_kb(group: str | None = None) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    target = f"settings:group:{group}" if group else "settings:open"
+    kb.button(text=BTN_BACK, callback_data=target)
     return kb.as_markup()
