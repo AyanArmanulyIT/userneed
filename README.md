@@ -1,3 +1,4 @@
+<img src="assets/banner.jpg" alt="banner" width="100%">
 # UserNeed
 
 Telegram-бот для поиска свободных username
